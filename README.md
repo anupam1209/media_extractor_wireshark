@@ -267,8 +267,10 @@ differences don't cause false failures. A correlation near **1.0** means the aud
 
 ## How it works
 
-1. **Detect** — `tshark` is run with heuristic RTP enabled; packets are grouped per stream and
-   summarized (codec, size, timing).
+1. **Detect** — `tshark` is run with heuristic RTP enabled. The RTP header and payload are parsed
+   from the raw UDP bytes (`udp.payload`) rather than tshark's `rtp.payload` field, so results are
+   identical across tshark versions and operating systems. Duplicate packets (same seq+timestamp,
+   from capture mirrors/taps) are dropped. Packets are grouped per stream and summarized.
 2. **Depacketize** — pure Python.
    - *Audio:* AMR is unpacked from RTP (per RFC 4867) and rebuilt into a standard `.amr` file
      (done in-tool because current GStreamer releases can't depacketize bandwidth-efficient AMR).
@@ -311,9 +313,9 @@ This is expected.
 
 ## Limitations & roadmap
 
-- **Video extraction** (H.264/H.265) is implemented and verified **pixel-exact on synthetic
-  H.264**, but has **not yet been confirmed against a real-world video capture**. Provide one and
-  it can be validated the same way the audio path was. **VP8** is detected but not yet extracted.
+- **H.264 video** is validated end-to-end (pixel-exact on synthetic streams, clean decode on a
+  real capture). **H.265** uses the same code path but has not yet been field-tested against a
+  real H.265 capture. **VP8** is detected but not yet extracted.
 - Audio codec coverage is AMR-NB, AMR-WB, and G.711. Others can be added on request.
 - The web server is single-purpose and unauthenticated — intended for local/trusted use.
 
