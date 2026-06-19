@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tshark -r wiresharks/filtered_16152_to_15288.pcap -o \"rtp.heuristic_rtp:TRUE\" -q -z rtp,streams)",
+      "Bash(tshark -r wiresharks/srcport_16148_dstport_14016.pcap -o \"rtp.heuristic_rtp:TRUE\" -q -z rtp,streams)",
+      "Bash(rm -f /tmp/poc_out.avi)",
+      "Bash(gst-launch-1.0 -e filesrc location=wiresharks/filtered_16152_to_15288.pcap ! pcapparse src-ip=10.63.5.25 src-port=16152 dst-ip=10.44.139.5 dst-port=15288 ! application/x-rtp,media=audio,clock-rate=8000,encoding-name=AMR,payload=118 ! rtpamrdepay ! amrnbdec ! audioconvert ! audioresample ! avimux ! filesink location=/tmp/poc_out.avi)",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Read(//tmp/**)",
+      "Bash(ffprobe -hide_banner -v error -show_entries stream=codec_name,sample_rate,channels,duration -of default=noprint_wrappers=1 /tmp/poc_out.avi)",
+      "Bash(ffprobe -hide_banner -v error -show_entries stream=codec_name,sample_rate,channels,duration -of default=noprint_wrappers=1 AP_MUTE_ISSUE/filtered_16152_to_15288.avi)",
+      "Bash(rm -f /tmp/poc.wav)",
+      "Bash(gst-launch-1.0 -e filesrc location=wiresharks/filtered_16152_to_15288.pcap ! pcapparse src-ip=10.63.5.25 src-port=16152 dst-ip=10.44.139.5 dst-port=15288 ! application/x-rtp,media=audio,clock-rate=8000,encoding-name=AMR,payload=118 ! rtpamrdepay octet-align=0 ! amrnbdec ! audioconvert ! audioresample ! wavenc ! filesink location=/tmp/poc.wav)",
+      "Bash(ffprobe -hide_banner -v error -count_frames -show_entries stream=duration,nb_read_frames -of default=noprint_wrappers=1 /tmp/poc.wav)",
+      "Bash(tshark -r wiresharks/filtered_16152_to_15288.pcap -o rtp.heuristic_rtp:TRUE -Y 'ip.src==10.63.5.25 && udp.srcport==16152 && rtp' -T fields -e rtp.payload)",
+      "Bash(awk '{print length\\($0\\)/2}')",
+      "Bash(ffmpeg -hide_banner -v error -i AP_MUTE_ISSUE/filtered_16152_to_15288.avi -af astats=metadata=1 -f null -)",
+      "Bash(ffmpeg -hide_banner -v error -i /tmp/poc_out.avi -af astats=metadata=1 -f null -)"
+    ]
+  }
+}
