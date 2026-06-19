@@ -98,7 +98,7 @@ function renderStreams(streams) {
   const tb = $('#tbl tbody'); tb.innerHTML = '';
   for (const s of streams) {
     const tr = document.createElement('tr');
-    const supported = ['AMR-NB','AMR-WB','G711u','G711a'].includes(s.codec);
+    const supported = ['AMR-NB','AMR-WB','G711u','G711a','H264','H265'].includes(s.codec);
     tr.innerHTML = `
       <td>${s.src_ip}:${s.src_port}</td>
       <td>${s.dst_ip}:${s.dst_port}</td>
@@ -129,9 +129,15 @@ async function extract(s, btn, out) {
       body: JSON.stringify({file_id: FILE_ID, stream: s, timing})});
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'extract failed');
-    out.innerHTML = `<a href="${d.download}" download>download</a> `
-      + `<span class="muted">(${d.duration_s}s${d.gaps_filled_s?(', '+d.gaps_filled_s+'s silence'):''})</span><br>`
-      + `<audio controls preload="none" src="${d.download}"></audio>`;
+    if (d.kind === 'video') {
+      out.innerHTML = `<a href="${d.download}" download>download</a> `
+        + `<span class="muted">(${d.frames} pkts, ${d.fps} fps)</span><br>`
+        + `<video controls preload="none" width="240" src="${d.download}"></video>`;
+    } else {
+      out.innerHTML = `<a href="${d.download}" download>download</a> `
+        + `<span class="muted">(${d.duration_s}s${d.gaps_filled_s?(', '+d.gaps_filled_s+'s silence'):''})</span><br>`
+        + `<audio controls preload="none" src="${d.download}"></audio>`;
+    }
   } catch (e) { out.innerHTML = '<span class="warn">'+e.message+'</span>'; }
   btn.disabled = false; btn.textContent = old;
 }
@@ -170,7 +176,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, "rb") as fh:
                 data = fh.read()
             fn = os.path.basename(path)
-            return self._send(200, data, "audio/wav",
+            ctype = "video/mp4" if fn.endswith(".mp4") else "audio/wav"
+            return self._send(200, data, ctype,
                               {"Content-Disposition": f'attachment; filename="{fn}"'})
         return self._send(404, {"error": "not found"})
 
@@ -214,10 +221,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "unknown file_id (re-upload)"})
         s = req["stream"]
         timing = req.get("timing", "accurate")
-        if s.get("codec") not in mediax.SUPPORTED:
-            return self._send(400, {"error": f"unsupported codec {s.get('codec')}"})
+        codec = s.get("codec")
+        if codec not in mediax.SUPPORTED:
+            return self._send(400, {"error": f"unsupported codec {codec}"})
+        is_video = codec in mediax.VIDEO_CODECS
+        ext = ".mp4" if is_video else ".wav"
+        tag = "" if is_video else f"_{timing}"
         name = (f'{s["src_ip"]}_{s["src_port"]}-{s["dst_ip"]}_{s["dst_port"]}'
-                f'_{s["ssrc"]}_{timing}.wav')
+                f'_{s["ssrc"]}{tag}{ext}')
         name = SAFE_NAME.sub("_", name)
         out_path = os.path.join(OUTPUTS, name)
         _, _, info = mediax.extract_stream(up["path"], s, out_path,

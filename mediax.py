@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-mediax — PCAP RTP media extractor (audio).
+mediax — PCAP RTP media extractor (audio + video).
 
 Commands:
   detect      : auto-detect every RTP stream + guess codec (no manual config)
-  extract     : extract one stream to WAV (auto-codec, or override)
-  extract-all : extract every supported audio stream from a PCAP to a folder
+  extract     : extract one stream (audio -> WAV, video -> MP4), auto-codec or override
+  extract-all : extract every supported media stream from a PCAP to a folder
   validate    : compare a WAV against a reference (.avi/.wav/.amr), drift-tolerant
+
+Video note:
+  H.264/H.265 streams are detected (90kHz clock / large payloads / NAL fingerprint), then
+  depacketized in pure Python (RFC 6184 / 7798) into an Annex-B elementary stream and remuxed
+  to MP4 with ffmpeg (-c copy, no re-encode). Video extraction is implemented to spec but has
+  not yet been validated against a real video capture.
 
 Codec handling:
   - Codec is inferred from RTP clock-rate (timestamp delta) + payload size, since these
@@ -35,7 +41,10 @@ AMR_NB_BITS = [95, 103, 118, 134, 148, 159, 204, 244, 39, 0, 0, 0, 0, 0, 0, 0]
 AMR_WB_BITS = [132, 177, 253, 285, 317, 365, 397, 461, 477, 40, 0, 0, 0, 0, 0, 0]
 
 STATIC_PT = {0: "G711u", 3: "GSM", 8: "G711a", 9: "G722", 18: "G729"}
-SUPPORTED = {"AMR-NB", "AMR-WB", "G711u", "G711a"}
+AUDIO_CODECS = {"AMR-NB", "AMR-WB", "G711u", "G711a"}
+VIDEO_CODECS = {"H264", "H265"}          # depacketize + remux supported (VP8 = detect-only)
+SUPPORTED = AUDIO_CODECS | VIDEO_CODECS
+START_CODE = b"\x00\x00\x00\x01"         # Annex-B NAL unit separator
 
 
 # --------------------------------------------------------------------------- #
@@ -71,13 +80,20 @@ def detect_streams(pcap):
         d = agg.get(key)
         if d is None:
             d = agg[key] = {"pt": pt, "pkts": 0, "sizes": Counter(),
-                            "deltas": Counter(), "last_ts": None, "t0": t, "t1": t}
+                            "deltas": Counter(), "last_ts": None, "t0": t, "t1": t,
+                            "max_size": 0, "same_ts": 0, "sample": None}
         d["pkts"] += 1
         if size:
             d["sizes"][size] += 1
+            if size > d["max_size"]:
+                d["max_size"] = size
+        if f[7] and d["sample"] is None:
+            d["sample"] = f[7].replace(":", "")  # hex of first payload (for video fingerprint)
         if ts is not None and d["last_ts"] is not None:
             delta = ts - d["last_ts"]
-            if 0 < delta < 4000:
+            if delta == 0:
+                d["same_ts"] += 1                 # multiple packets per frame => likely video
+            elif 0 < delta < 4000:
                 d["deltas"][delta] += 1
         if ts is not None:
             d["last_ts"] = ts
@@ -89,27 +105,55 @@ def detect_streams(pcap):
             "src_ip": sip, "src_port": sport, "dst_ip": dip, "dst_port": dport,
             "ssrc": f"0x{ssrc:08X}", "pt": d["pt"], "pkts": d["pkts"],
             "mode_size": d["sizes"].most_common(1)[0][0] if d["sizes"] else None,
+            "max_size": d["max_size"], "same_ts": d["same_ts"],
             "ts_delta": d["deltas"].most_common(1)[0][0] if d["deltas"] else None,
             "duration": round(d["t1"] - d["t0"], 2),
         }
-        s["codec"], s["wideband"], s["mode"] = classify(s)
+        s["codec"], s["wideband"], s["mode"] = classify(s, d["sample"])
         streams.append(s)
     streams.sort(key=lambda x: -x["pkts"])
     return streams
 
 
-def classify(s):
-    """Return (codec, wideband, amr_mode). Uses static PT map, then clock-rate/size heuristic."""
+def classify(s, sample=None):
+    """Return (codec, wideband, amr_mode). Static PT map, then audio (clock-rate/size), then video."""
     pt = s.get("pt", -1)
     if pt in STATIC_PT:
-        c = STATIC_PT[pt]
-        return c, False, None
+        return STATIC_PT[pt], False, None
     delta, size = s.get("ts_delta"), s.get("mode_size")
     if delta == 160 or size == 32:
         return "AMR-NB", False, "be"
     if delta == 320 or size in (60, 61):
         return "AMR-WB", True, "be"
+    # video: large/variable payloads or multiple packets sharing one RTP timestamp (a frame)
+    if (s.get("max_size", 0) or 0) > 200 or (s.get("same_ts", 0) or 0) > 0:
+        return fingerprint_video(sample), False, None
     return f"PT{pt}", False, "be"  # unknown / unsupported
+
+
+def fingerprint_video(sample):
+    """Best-effort video codec from the first RTP payload's NAL header.
+    H.264 (RFC 6184): 1-byte NAL header, type = b0 & 0x1F.
+    H.265 (RFC 7798): 2-byte NAL header, type = (b0 >> 1) & 0x3F."""
+    if not sample:
+        return "video"
+    try:
+        b = bytes.fromhex(sample)
+    except ValueError:
+        return "video"
+    if not b or (b[0] & 0x80):  # forbidden_zero_bit must be 0 for a real NAL
+        return "video"
+    t264 = b[0] & 0x1F
+    t265 = (b[0] >> 1) & 0x3F
+    if t265 in (48, 49, 50):                 # H.265 AP / FU / PACI (distinctive)
+        return "H265"
+    if t264 in (24, 28, 29):                 # H.264 STAP-A / FU-A / FU-B (distinctive)
+        return "H264"
+    if t265 in (32, 33, 34, 19, 20, 21):     # H.265 VPS/SPS/PPS/IDR
+        return "H265"
+    if t264 in (1, 5, 6, 7, 8):              # H.264 slice/IDR/SEI/SPS/PPS
+        return "H264"
+    return "video"
 
 
 # --------------------------------------------------------------------------- #
@@ -277,22 +321,122 @@ def decode_amr(amr_path, out_wav, wideband):
     return "ffmpeg:native"
 
 
-def extract_stream(pcap, s, out_wav, codec=None, mode=None, timing="accurate"):
-    """Extract one stream to WAV. Auto-classifies if codec is None.
+# --------------------------------------------------------------------------- #
+# RTP video -> Annex-B elementary stream (RFC 6184 / RFC 7798)
+# --------------------------------------------------------------------------- #
+def depacketize_h264(payloads):
+    """H.264 RTP payloads -> Annex-B byte stream (single NAL / STAP-A / FU-A / FU-B)."""
+    out = bytearray()
+    for p in payloads:
+        if not p:
+            continue
+        t = p[0] & 0x1F
+        if 1 <= t <= 23:                          # single NAL unit
+            out += START_CODE + p
+        elif t == 24:                             # STAP-A aggregation
+            i = 1
+            while i + 2 <= len(p):
+                sz = (p[i] << 8) | p[i + 1]
+                i += 2
+                out += START_CODE + p[i:i + sz]
+                i += sz
+        elif t in (28, 29):                       # FU-A / FU-B (fragmentation)
+            if len(p) < 2:
+                continue
+            offset = 4 if t == 29 else 2          # FU-B carries a 2-byte DON
+            if p[1] & 0x80:                       # start fragment -> rebuild NAL header
+                nal = (p[0] & 0xE0) | (p[1] & 0x1F)
+                out += START_CODE + bytes([nal]) + p[offset:]
+            else:
+                out += p[offset:]
+        # STAP-B(25)/MTAP(26,27)/reserved -> skip
+    return bytes(out)
 
-    timing="accurate" places each frame at its RTP timestamp (silence fills DTX gaps);
-    timing="compact" concatenates received frames back-to-back.
-    Returns (frames, decoder, info-dict).
+
+def depacketize_h265(payloads):
+    """H.265 RTP payloads -> Annex-B byte stream (single NAL / AP / FU)."""
+    out = bytearray()
+    for p in payloads:
+        if len(p) < 2:
+            continue
+        t = (p[0] >> 1) & 0x3F
+        if t <= 47:                               # single NAL unit
+            out += START_CODE + p
+        elif t == 48:                             # AP aggregation
+            i = 2
+            while i + 2 <= len(p):
+                sz = (p[i] << 8) | p[i + 1]
+                i += 2
+                out += START_CODE + p[i:i + sz]
+                i += sz
+        elif t == 49:                             # FU (fragmentation)
+            if len(p) < 3:
+                continue
+            if p[2] & 0x80:                        # start fragment -> rebuild 2-byte NAL header
+                h0 = (p[0] & 0x81) | ((p[2] & 0x3F) << 1)
+                out += START_CODE + bytes([h0, p[1]]) + p[3:]
+            else:
+                out += p[3:]
+        # PACI(50)/reserved -> skip
+    return bytes(out)
+
+
+def _video_fps(ts_list):
+    """Frame rate from the 90 kHz RTP timestamps (frame = a distinct timestamp)."""
+    ts = _unwrap_ts(ts_list)
+    deltas = []
+    prev = ts[0]
+    for t in ts[1:]:
+        if t > prev:
+            deltas.append(t - prev)
+            prev = t
+    if not deltas:
+        return 25.0
+    deltas.sort()
+    d = deltas[len(deltas) // 2]  # median inter-frame timestamp delta
+    return round(90000 / d, 2) if d > 0 else 25.0
+
+
+def extract_video(pcap, s, out_path, codec):
+    """Depacketize a video stream to Annex-B, then remux to MP4 (no re-encode)."""
+    rows = get_rtp_payloads_ts(pcap, s)
+    if not rows:
+        raise SystemExit("no RTP payloads matched the stream")
+    payloads = [p for _, p in rows]
+    fps = _video_fps([t for t, _ in rows])
+    if codec == "H264":
+        es, demux, suffix = depacketize_h264(payloads), "h264", ".h264"
+    elif codec == "H265":
+        es, demux, suffix = depacketize_h265(payloads), "hevc", ".h265"
+    else:
+        raise SystemExit(f"video codec '{codec}' is detect-only (extraction not implemented)")
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+        tf.write(es)
+        raw_path = tf.name
+    subprocess.run([FFMPEG, "-y", "-v", "error", "-r", str(fps),
+                    "-f", demux, "-i", raw_path, "-c", "copy", out_path], check=True)
+    os.unlink(raw_path)
+    info = {"frames": len(payloads), "decoder": "ffmpeg:remux", "kind": "video",
+            "container": "mp4", "fps": fps,
+            "note": "validated pixel-exact on synthetic H.264; confirm against a real capture"}
+    return len(payloads), "ffmpeg:remux", info
+
+
+def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
+    """Extract one stream. Audio -> WAV (RTP-timestamp accurate by default); video -> MP4.
+    Auto-classifies if codec is None. Returns (frames, decoder, info-dict).
     """
     if codec is None:
-        codec, wideband, m = classify(s)
-        mode = mode or m
-    else:
-        wideband = codec == "AMR-WB"
-        mode = mode or s.get("mode") or "be"
-    if codec not in SUPPORTED:
+        codec = s.get("codec") or classify(s)[0]
+    mode = mode or s.get("mode") or "be"
+    wideband = codec == "AMR-WB"
+
+    if codec in VIDEO_CODECS:
+        return extract_video(pcap, s, out_path, codec)
+    if codec not in AUDIO_CODECS:
         raise SystemExit(f"unsupported codec '{codec}' for this stream (override with --codec)")
 
+    out_wav = out_path
     rows = get_rtp_payloads_ts(pcap, s)
     if not rows:
         raise SystemExit("no RTP payloads matched the stream")
@@ -344,7 +488,7 @@ def extract_stream(pcap, s, out_wav, codec=None, mode=None, timing="accurate"):
 
 
 def extract_all(pcap, out_dir, min_pkts=20, timing="accurate"):
-    """Extract every supported audio stream from a PCAP into out_dir. Returns per-stream records."""
+    """Extract every supported media stream (audio->WAV, video->MP4) into out_dir."""
     os.makedirs(out_dir, exist_ok=True)
     results = []
     for s in detect_streams(pcap):
@@ -355,7 +499,8 @@ def extract_all(pcap, out_dir, min_pkts=20, timing="accurate"):
         elif s["pkts"] < min_pkts:
             rec["status"] = f"skipped (<{min_pkts} pkts)"
         else:
-            name = f'{s["src_ip"]}_{s["src_port"]}-{s["dst_ip"]}_{s["dst_port"]}_{s["ssrc"]}.wav'
+            ext = ".mp4" if s["codec"] in VIDEO_CODECS else ".wav"
+            name = f'{s["src_ip"]}_{s["src_port"]}-{s["dst_ip"]}_{s["dst_port"]}_{s["ssrc"]}{ext}'
             out = os.path.join(out_dir, name)
             n, dec, info = extract_stream(pcap, s, out, codec=s["codec"],
                                           mode=s["mode"], timing=timing)
@@ -438,14 +583,14 @@ def _find_stream(streams, sport, dport, src=None, dst=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="PCAP RTP media extractor (audio)")
+    ap = argparse.ArgumentParser(description="PCAP RTP media extractor (audio + video)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("detect", help="list RTP streams with codec guess")
     d.add_argument("pcap")
     d.add_argument("--json", action="store_true")
 
-    e = sub.add_parser("extract", help="extract one stream to WAV")
+    e = sub.add_parser("extract", help="extract one stream (audio->WAV, video->MP4)")
     e.add_argument("pcap")
     e.add_argument("--src"); e.add_argument("--sport", type=int, required=True)
     e.add_argument("--dst"); e.add_argument("--dport", type=int, required=True)
@@ -456,7 +601,7 @@ def main():
     e.add_argument("-o", "--out", required=True)
     e.add_argument("--validate-against")
 
-    a = sub.add_parser("extract-all", help="extract every supported audio stream to a folder")
+    a = sub.add_parser("extract-all", help="extract every supported media stream to a folder")
     a.add_argument("pcap")
     a.add_argument("-o", "--out-dir", required=True)
     a.add_argument("--timing", choices=["accurate", "compact"], default="accurate")
