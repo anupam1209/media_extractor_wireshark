@@ -1,11 +1,12 @@
 # PCAP RTP Media Extractor
 
-Extract audio from RTP streams in a packet capture (`.pcap` / `.pcapng`), **automatically**.
+Extract **audio and video** from RTP streams in a packet capture (`.pcap` / `.pcapng`),
+**automatically**.
 
 Point it at a capture and it finds every RTP stream, figures out the codec on its own (no
-manual IP/port/codec configuration), and gives you a downloadable `.wav` for each one. It
-works through a simple **web page** or a **command line**, and it runs anywhere Python does —
-no build step and no Python packages to install.
+manual IP/port/codec configuration), and gives you a downloadable file for each one — `.wav`
+for audio, `.mp4` for video. It works through a simple **web page** or a **command line**, and
+it runs anywhere Python does — no build step and no Python packages to install.
 
 It was built to investigate conference "mute" issues, so by default it reconstructs audio on
 the **real timeline**: when a talker went silent (and the sender stopped transmitting), you
@@ -34,12 +35,12 @@ hear silence at exactly that point.
 ## What it can do
 
 - **Auto-detect** every RTP stream in a capture (source/destination, SSRC, packet count, duration).
-- **Auto-identify the codec** with no manual config (AMR-NB, AMR-WB, G.711 µ-law/A-law).
-- **Extract & decode** each stream to a standard `.wav` file.
-- **Preserve real timing** — silence is inserted where the audio actually dropped (great for mute analysis).
+- **Auto-identify the codec** with no manual config — audio (AMR-NB, AMR-WB, G.711 µ-law/A-law) and video (H.264, H.265).
+- **Extract & decode** each stream: audio to `.wav`, video to `.mp4` (remuxed, no re-encode).
+- **Preserve real timing** (audio) — silence is inserted where the audio actually dropped (great for mute analysis).
 - **Web UI**: upload → see the streams → click to extract → download / play in the browser.
 - **CLI**: scriptable for batch processing whole folders of captures.
-- **Validate** output against a known-good reference file (correlation-based PASS/FAIL).
+- **Validate** audio output against a known-good reference file (correlation-based PASS/FAIL).
 
 ---
 
@@ -197,8 +198,9 @@ Decodes both to PCM and reports a drift-tolerant correlation score and `PASS`/`F
 
 ## Output files
 
-- Format: **mono WAV, 16-bit PCM** — 8 kHz for AMR-NB / G.711, 16 kHz for AMR-WB.
-- `extract` writes to the path you give with `-o`.
+- **Audio**: mono WAV, 16-bit PCM — 8 kHz for AMR-NB / G.711, 16 kHz for AMR-WB.
+- **Video**: MP4 (H.264/H.265 stream copied in, not re-encoded), framerate from RTP timestamps.
+- `extract` writes to the path you give with `-o` (use a `.mp4` path for a video stream).
 - `extract-all` names each file:
   ```
   <src-ip>_<src-port>-<dst-ip>_<dst-port>_<ssrc>.wav
@@ -225,6 +227,8 @@ For a stream with silence gaps, *real timing* produces a longer file (e.g. 43.5 
 
 ## Supported codecs
 
+**Audio** (output: `.wav`)
+
 | Codec | RTP detection | Notes |
 |-------|---------------|-------|
 | **AMR-NB** | clock-rate 8 kHz / ~32-byte frames | bandwidth-efficient and octet-aligned both supported |
@@ -232,8 +236,17 @@ For a stream with silence gaps, *real timing* produces a longer file (e.g. 43.5 
 | **G.711 µ-law (PCMU)** | static payload type 0 | |
 | **G.711 A-law (PCMA)** | static payload type 8 | |
 
-Codec is inferred from the RTP clock rate and payload size because these captures carry no SDP
-signaling. If a stream is mis-identified, override it with `--codec` (CLI).
+**Video** (output: `.mp4`, remuxed without re-encoding)
+
+| Codec | RTP detection | Notes |
+|-------|---------------|-------|
+| **H.264 / AVC** | large/variable payloads + NAL fingerprint | single NAL, STAP-A, FU-A/FU-B handled |
+| **H.265 / HEVC** | large/variable payloads + NAL fingerprint | single NAL, AP, FU handled |
+| VP8 | large/variable payloads | **detected only** — extraction not implemented yet |
+
+Codec is inferred from the RTP clock rate, payload size, and (for video) the NAL header in the
+payload, because these captures carry no SDP signaling. If a stream is mis-identified, override
+it with `--codec` (CLI). Video framerate is recovered from the RTP timestamps.
 
 ---
 
@@ -256,13 +269,15 @@ differences don't cause false failures. A correlation near **1.0** means the aud
 
 1. **Detect** — `tshark` is run with heuristic RTP enabled; packets are grouped per stream and
    summarized (codec, size, timing).
-2. **Depacketize** — AMR is unpacked from RTP in pure Python (per RFC 4867) and rebuilt into a
-   standard `.amr` file. (This is done in-tool because current GStreamer releases can't depacketize
-   bandwidth-efficient AMR.)
-3. **Decode** — the `.amr` is decoded by GStreamer's `amrnbdec`/`amrwbdec` (or ffmpeg as a
-   fallback); G.711 is decoded directly by ffmpeg.
-4. **Reconstruct** — decoded frames are placed on the real timeline using RTP timestamps, filling
-   silence gaps (or concatenated, in compact mode), and written as WAV.
+2. **Depacketize** — pure Python.
+   - *Audio:* AMR is unpacked from RTP (per RFC 4867) and rebuilt into a standard `.amr` file
+     (done in-tool because current GStreamer releases can't depacketize bandwidth-efficient AMR).
+   - *Video:* H.264/H.265 NAL units are reassembled from RTP (RFC 6184 / 7798 — single NAL,
+     aggregation, and fragmentation) into an Annex-B elementary stream.
+3. **Decode / mux** — audio `.amr` is decoded by GStreamer's `amrnbdec`/`amrwbdec` (or ffmpeg),
+   G.711 by ffmpeg; video is remuxed into MP4 with ffmpeg `-c copy` (no re-encode).
+4. **Reconstruct** (audio) — decoded frames are placed on the real timeline using RTP timestamps,
+   filling silence gaps (or concatenated, in compact mode), and written as WAV.
 
 ---
 
@@ -296,9 +311,10 @@ This is expected.
 
 ## Limitations & roadmap
 
-- **Audio only, for now.** Video RTP (e.g. H.264/H.265) is on the roadmap — audio and video will
-  be extracted via separate pipelines. Provide a capture that contains video to enable this.
-- Codec coverage is currently AMR-NB, AMR-WB, and G.711. Others can be added on request.
+- **Video extraction** (H.264/H.265) is implemented and verified **pixel-exact on synthetic
+  H.264**, but has **not yet been confirmed against a real-world video capture**. Provide one and
+  it can be validated the same way the audio path was. **VP8** is detected but not yet extracted.
+- Audio codec coverage is AMR-NB, AMR-WB, and G.711. Others can be added on request.
 - The web server is single-purpose and unauthenticated — intended for local/trusted use.
 
 ---
