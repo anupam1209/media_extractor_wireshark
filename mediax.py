@@ -48,6 +48,39 @@ START_CODE = b"\x00\x00\x00\x01"         # Annex-B NAL unit separator
 
 
 # --------------------------------------------------------------------------- #
+# RTP parsing — we parse the RTP header/payload ourselves from the raw UDP
+# payload (`udp.payload`) instead of relying on tshark's `rtp.payload` field.
+# Different tshark versions stop populating `rtp.payload` once they sub-dissect
+# the codec (e.g. H.264), which made detection/extraction differ across machines.
+# `udp.payload` is the raw bytes and is identical on every tshark version.
+# --------------------------------------------------------------------------- #
+def parse_rtp(buf):
+    """Parse an RTP packet (bytes). Returns dict(pt, seq, ts, ssrc, payload) or None."""
+    if len(buf) < 12 or (buf[0] >> 6) != 2:   # require RTP version 2
+        return None
+    cc = buf[0] & 0x0F
+    padding = (buf[0] >> 5) & 1
+    ext = (buf[0] >> 4) & 1
+    off = 12 + 4 * cc
+    if ext:
+        if len(buf) < off + 4:
+            return None
+        off += 4 + 4 * ((buf[off + 2] << 8) | buf[off + 3])
+    payload = buf[off:]
+    if padding and payload:
+        pad = payload[-1]
+        if 0 < pad <= len(payload):
+            payload = payload[:-pad]
+    return {
+        "pt": buf[1] & 0x7F,
+        "seq": (buf[2] << 8) | buf[3],
+        "ts": int.from_bytes(buf[4:8], "big"),
+        "ssrc": int.from_bytes(buf[8:12], "big"),
+        "payload": payload,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Detection (single tshark pass, aggregated per stream)
 # --------------------------------------------------------------------------- #
 def detect_streams(pcap):
@@ -56,26 +89,28 @@ def detect_streams(pcap):
     out = subprocess.run(
         [TSHARK, "-r", pcap, "-o", "rtp.heuristic_rtp:TRUE", "-Y", "rtp", "-T", "fields",
          "-e", "ip.src", "-e", "udp.srcport", "-e", "ip.dst", "-e", "udp.dstport",
-         "-e", "rtp.ssrc", "-e", "rtp.p_type", "-e", "rtp.timestamp",
-         "-e", "rtp.payload", "-e", "frame.time_relative"],
+         "-e", "udp.payload", "-e", "frame.time_relative"],
         capture_output=True, text=True,
     ).stdout
     agg = {}
     for line in out.splitlines():
         f = line.split("\t")
-        if len(f) < 9 or not f[1] or not f[3] or not f[4]:
+        if len(f) < 6 or not f[1] or not f[3]:
             continue
         # tunneled/fragmented packets can yield comma-joined fields; take the first value
         f = [c.split(",")[0] for c in f]
+        up = f[4].replace(":", "")
+        if len(up) < 24:                          # need at least a 12-byte RTP header
+            continue
         try:
             sip, sport, dip, dport = f[0], int(f[1]), f[2], int(f[3])
-            ssrc = int(f[4], 0)
-            pt = int(f[5]) if f[5] else -1
-            ts = int(f[6]) if f[6] else None
-            size = len(f[7].replace(":", "")) // 2 if f[7] else 0
-            t = float(f[8]) if f[8] else 0.0
+            pt = int(up[2:4], 16) & 0x7F          # RTP header fields read straight from bytes
+            ts = int(up[8:16], 16)
+            ssrc = int(up[16:24], 16)
+            t = float(f[5]) if f[5] else 0.0
         except ValueError:
             continue
+        size = len(up) // 2 - 12                  # approx payload size (ignores CSRC/extension)
         key = (sip, sport, dip, dport, ssrc)
         d = agg.get(key)
         if d is None:
@@ -83,20 +118,19 @@ def detect_streams(pcap):
                             "deltas": Counter(), "last_ts": None, "t0": t, "t1": t,
                             "max_size": 0, "same_ts": 0, "sample": None}
         d["pkts"] += 1
-        if size:
+        if size > 0:
             d["sizes"][size] += 1
             if size > d["max_size"]:
                 d["max_size"] = size
-        if f[7] and d["sample"] is None:
-            d["sample"] = f[7].replace(":", "")  # hex of first payload (for video fingerprint)
-        if ts is not None and d["last_ts"] is not None:
+        if d["sample"] is None:
+            d["sample"] = up                      # first whole RTP packet (for video fingerprint)
+        if d["last_ts"] is not None:
             delta = ts - d["last_ts"]
             if delta == 0:
                 d["same_ts"] += 1                 # multiple packets per frame => likely video
             elif 0 < delta < 4000:
                 d["deltas"][delta] += 1
-        if ts is not None:
-            d["last_ts"] = ts
+        d["last_ts"] = ts
         d["t1"] = t
 
     streams = []
@@ -109,14 +143,18 @@ def detect_streams(pcap):
             "ts_delta": d["deltas"].most_common(1)[0][0] if d["deltas"] else None,
             "duration": round(d["t1"] - d["t0"], 2),
         }
-        s["codec"], s["wideband"], s["mode"] = classify(s, d["sample"])
+        s["codec"], s["wideband"], s["mode"] = classify(s)
+        if s["codec"] == "video":                 # refine to H264/H265 from the actual NAL header
+            r = parse_rtp(bytes.fromhex(d["sample"])) if d["sample"] else None
+            s["codec"] = fingerprint_video(r["payload"].hex() if r else None)
         streams.append(s)
     streams.sort(key=lambda x: -x["pkts"])
     return streams
 
 
-def classify(s, sample=None):
-    """Return (codec, wideband, amr_mode). Static PT map, then audio (clock-rate/size), then video."""
+def classify(s):
+    """Return (codec, wideband, amr_mode). Static PT map, then audio (clock-rate/size), then video.
+    Video-shaped streams return the generic "video"; detect_streams refines to H264/H265."""
     pt = s.get("pt", -1)
     if pt in STATIC_PT:
         return STATIC_PT[pt], False, None
@@ -127,7 +165,7 @@ def classify(s, sample=None):
         return "AMR-WB", True, "be"
     # video: large/variable payloads or multiple packets sharing one RTP timestamp (a frame)
     if (s.get("max_size", 0) or 0) > 200 or (s.get("same_ts", 0) or 0) > 0:
-        return fingerprint_video(sample), False, None
+        return "video", False, None
     return f"PT{pt}", False, "be"  # unknown / unsupported
 
 
@@ -237,22 +275,30 @@ def depacketize_oa(payload, wideband=False):
 # Payload extraction + decode
 # --------------------------------------------------------------------------- #
 def get_rtp_payloads_ts(pcap, s):
-    """[(timestamp, payload)] for one stream (by 5-tuple + SSRC), ordered by sequence number."""
+    """[(timestamp, payload)] for one stream (by 5-tuple + SSRC), ordered by sequence number.
+    Payloads are parsed from the raw UDP bytes so results are identical across tshark versions."""
     flt = (f'ip.src=={s["src_ip"]} && udp.srcport=={s["src_port"]} && '
            f'ip.dst=={s["dst_ip"]} && udp.dstport=={s["dst_port"]} && '
            f'rtp.ssrc=={s["ssrc"]} && rtp')
     out = subprocess.run(
         [TSHARK, "-r", pcap, "-o", "rtp.heuristic_rtp:TRUE", "-Y", flt,
-         "-T", "fields", "-e", "rtp.seq", "-e", "rtp.timestamp", "-e", "rtp.payload"],
+         "-T", "fields", "-e", "udp.payload"],
         capture_output=True, text=True,
     ).stdout
-    rows = []
+    rows, seen = [], set()
     for line in out.splitlines():
-        p = line.split("\t")
-        if len(p) < 3 or not p[2]:
+        h = line.strip().replace(":", "")
+        if not h:
             continue
-        rows.append((int(p[0]), int(p[1]), bytes.fromhex(p[2].replace(":", ""))))
-    rows.sort(key=lambda r: r[0])  # by sequence number
+        r = parse_rtp(bytes.fromhex(h))
+        if r is None:
+            continue
+        key = (r["seq"], r["ts"])      # drop duplicate packets (same seq+ts) — capture mirrors, taps
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((r["seq"], r["ts"], r["payload"]))
+    rows.sort(key=lambda r: r[0])      # by sequence number
     return [(ts, pl) for _, ts, pl in rows]
 
 
@@ -418,7 +464,8 @@ def extract_video(pcap, s, out_path, codec):
     os.unlink(raw_path)
     info = {"frames": len(payloads), "decoder": "ffmpeg:remux", "kind": "video",
             "container": "mp4", "fps": fps,
-            "note": "validated pixel-exact on synthetic H.264; confirm against a real capture"}
+            "note": "H.264 validated (synthetic pixel-exact + real-capture clean decode); "
+                    "H.265 not yet field-tested"}
     return len(payloads), "ffmpeg:remux", info
 
 
