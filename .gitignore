@@ -1,0 +1,10 @@
+# Runtime working dir (uploads + extracted outputs)
+_work/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+**/.DS_Store
