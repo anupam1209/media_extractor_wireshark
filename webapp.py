@@ -29,53 +29,180 @@ SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 MAX_UPLOAD = 500 * 1024 * 1024  # 500 MB cap
 
 PAGE = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>PCAP RTP Media Extractor</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCAP RTP Media Extractor</title>
+<!-- Inter is loaded only as a graceful web substitute for SF Pro on non-Apple devices;
+     if offline it simply falls back to the native system stack below. No JS libraries. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 2rem; max-width: 1100px; }
-  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
-  .sub { opacity: .7; margin-bottom: 1.5rem; }
-  .card { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
-  table { border-collapse: collapse; width: 100%; font-size: 14px; }
-  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #8883; white-space: nowrap; }
-  th { font-weight: 600; opacity: .75; }
-  tr:hover td { background: #8881; }
-  button { font: inherit; padding: .35rem .8rem; border-radius: 7px; border: 1px solid #8886;
-           background: #2b6cb0; color: #fff; cursor: pointer; }
-  button:disabled { background: #8884; color: #8888; cursor: not-allowed; }
-  .pill { font-size: 12px; padding: .1rem .5rem; border-radius: 999px; background: #8882; }
-  .ok { color: #2f855a; } .warn { color: #b7791f; }
-  input[type=file] { font: inherit; }
-  label.timing { margin-right: 1rem; opacity:.85; }
-  audio { height: 32px; vertical-align: middle; }
-  .muted { opacity:.6; }
-  #status { margin-left: .75rem; opacity:.8; }
+  :root{
+    --font:"SF Pro Display","SF Pro Text",-apple-system,BlinkMacSystemFont,"Inter","Helvetica Neue",Helvetica,Arial,sans-serif;
+    --bg:#fbfbfd; --surface:#ffffff; --ink:#1d1d1f; --ink2:#6e6e73;
+    --hair:#d2d2d7; --blue:#0071e3; --blue-h:#0077ed;
+    --ease:cubic-bezier(.25,.1,.25,1); --max:1200px;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);
+       font-weight:400;line-height:1.47;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;}
+  a{color:var(--blue);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+
+  /* frosted sticky nav */
+  .nav{position:sticky;top:0;z-index:100;background:rgba(251,251,253,.72);
+       backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
+       border-bottom:1px solid rgba(0,0,0,.08);}
+  .nav-inner{max-width:var(--max);margin:0 auto;padding:0 22px;height:48px;display:flex;align-items:center;gap:.7rem;}
+  .brand{font-size:17px;font-weight:600;letter-spacing:-.01em;}
+  .nav-tag{font-size:12px;color:var(--ink2);letter-spacing:.02em;border:1px solid var(--hair);border-radius:980px;padding:1px 9px;}
+
+  main{max-width:var(--max);margin:0 auto;padding:0 22px;}
+
+  /* hero */
+  .hero{position:relative;text-align:center;padding:96px 0 56px;overflow:hidden;}
+  .hero-bg{position:absolute;inset:-25% -10% 0;z-index:-1;pointer-events:none;will-change:transform;
+           background:radial-gradient(58% 48% at 50% 0%, rgba(0,113,227,.12), transparent 70%);}
+  h1{font-size:clamp(32px,6vw,80px);line-height:1.05;font-weight:700;letter-spacing:-.03em;
+     margin:0 auto;max-width:min(16ch,100%);overflow-wrap:break-word;}
+  .sub{font-size:clamp(17px,2.4vw,26px);line-height:1.4;font-weight:400;color:var(--ink2);
+       margin:.7em auto 0;max-width:min(40ch,100%);letter-spacing:-.01em;overflow-wrap:break-word;}
+
+  /* upload */
+  .upload{margin-top:36px;display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:center;}
+  input[type=file]{font:inherit;color:var(--ink2);max-width:100%;}
+  input[type=file]::file-selector-button{font:inherit;font-weight:500;cursor:pointer;margin-right:12px;
+       padding:9px 18px;border-radius:980px;border:1px solid var(--hair);background:var(--surface);color:var(--ink);
+       transition:background .3s var(--ease),border-color .3s var(--ease);}
+  input[type=file]::file-selector-button:hover{background:#f5f5f7;border-color:#c7c7cc;}
+  .btn{font:inherit;font-weight:500;cursor:pointer;padding:10px 22px;border-radius:980px;border:0;
+       background:var(--blue);color:#fff;letter-spacing:-.01em;
+       transition:transform .3s var(--ease),background .3s var(--ease),opacity .3s var(--ease);}
+  .btn:hover{background:var(--blue-h);transform:scale(1.03);}
+  .btn:active{transform:scale(.98);}
+  .btn:disabled{background:#b9b9be;cursor:not-allowed;transform:none;}
+  #status{display:block;width:100%;margin-top:10px;color:var(--ink2);font-size:14px;}
+
+  /* results */
+  .results{margin:28px 0 100px;}
+  .results-head{display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between;margin-bottom:18px;}
+  .results-head h2{font-size:clamp(26px,3.4vw,40px);font-weight:600;letter-spacing:-.02em;margin:0;}
+  .timing-toggle{display:flex;gap:4px;background:#f0f0f3;border-radius:980px;padding:4px;}
+  .timing{font-size:13px;color:var(--ink2);cursor:pointer;padding:6px 14px;border-radius:980px;transition:all .3s var(--ease);}
+  .timing input{position:absolute;opacity:0;pointer-events:none;}
+  .timing:has(input:checked){background:var(--surface);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08);}
+
+  .card{background:var(--surface);border-radius:18px;border:1px solid rgba(0,0,0,.06);overflow:hidden;}
+  .table-wrap{overflow-x:auto;}
+  table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums;}
+  th,td{text-align:left;padding:14px 18px;border-bottom:1px solid #f0f0f2;white-space:nowrap;}
+  thead th{font-size:11px;font-weight:600;color:var(--ink2);letter-spacing:.04em;text-transform:uppercase;background:#fafafc;}
+  tbody tr{transition:background .25s var(--ease);}
+  tbody tr:last-child td{border-bottom:0;}
+  tbody tr:hover{background:#f7f7f9;}
+  .pill{font-size:12px;font-weight:500;padding:3px 11px;border-radius:980px;background:#f0f0f3;color:var(--ink);}
+  .muted{color:var(--ink2);}
+  .warn{color:#bf4800;}
+  .ok{color:#1d8a4e;}
+
+  /* Apple-style black pill for the in-table Extract action */
+  .btn-extract{font-family:inherit;font-size:14px;font-weight:500;letter-spacing:-.01em;
+    color:#fff;background:#1d1d1f;border:0;border-radius:980px;padding:9px 22px;
+    cursor:pointer;transition:all .2s ease;}
+  .btn-extract:hover{background:#424245;}
+  .btn-extract:active{transform:scale(.97);}
+  .btn-extract:focus{outline:none;}
+  .btn-extract:focus-visible{outline:none;box-shadow:0 0 0 4px rgba(0,0,0,.18);}
+  .btn-extract:disabled{opacity:.5;cursor:default;}
+
+  th.out-col,td.out{min-width:360px;}
+  td.out{white-space:normal;}
+  td.out audio,td.out video{display:block;margin-top:.5rem;border-radius:10px;}
+  td.out audio{width:340px;height:38px;}
+  td.out video{width:340px;max-width:100%;}
+
+  /* scroll-reveal */
+  .reveal{opacity:0;transform:translateY(30px);transition:opacity .8s var(--ease),transform .8s var(--ease);}
+  .reveal.in{opacity:1;transform:none;}
+
+  @media (max-width:600px){
+    .hero{padding:60px 0 36px;}
+    th,td{padding:12px 14px;}
+    .results-head{align-items:flex-start;}
+  }
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto;}
+    .reveal{opacity:1 !important;transform:none !important;transition:none !important;}
+    .btn:hover{transform:none;}
+    .hero-bg{transform:none !important;}
+  }
 </style></head>
 <body>
-  <h1>PCAP RTP Media Extractor</h1>
-  <div class="sub">Upload a capture &rarr; streams are auto-detected &rarr; extract & download audio.</div>
-
-  <div class="card">
-    <input type="file" id="file" accept=".pcap,.pcapng,.cap">
-    <button id="up">Upload &amp; detect</button>
-    <span id="status"></span>
-  </div>
-
-  <div class="card" id="result" style="display:none">
-    <div style="margin-bottom:.75rem">
-      <strong>Detected streams</strong> &nbsp;
-      <label class="timing"><input type="radio" name="timing" value="accurate" checked> Real timing (silence in gaps)</label>
-      <label class="timing"><input type="radio" name="timing" value="compact"> Compact (speech only)</label>
+  <nav class="nav">
+    <div class="nav-inner">
+      <span class="brand">PCAP RTP Media Extractor</span>
+      <span class="nav-tag">RTP &middot; PCAP</span>
     </div>
-    <table id="tbl"><thead><tr>
-      <th>Source</th><th>Destination</th><th>SSRC</th><th>Codec</th>
-      <th>Pkts</th><th>Dur (s)</th><th>Action</th><th>Output</th>
-    </tr></thead><tbody></tbody></table>
-  </div>
+  </nav>
+
+  <main>
+    <section class="hero">
+      <div class="hero-bg" id="heroBg"></div>
+      <h1 class="reveal">PCAP RTP Media Extractor</h1>
+      <p class="sub reveal">Upload a capture &rarr; streams are auto-detected &rarr; extract &amp; download audio.</p>
+      <div class="upload reveal">
+        <input type="file" id="file" accept=".pcap,.pcapng,.cap">
+        <button id="up" class="btn">Upload &amp; detect</button>
+        <span id="status"></span>
+      </div>
+    </section>
+
+    <section class="results" id="result" style="display:none">
+      <div class="results-head reveal">
+        <h2>Detected streams</h2>
+        <div class="timing-toggle">
+          <label class="timing"><input type="radio" name="timing" value="accurate" checked> Real timing (silence in gaps)</label>
+          <label class="timing"><input type="radio" name="timing" value="compact"> Compact (speech only)</label>
+        </div>
+      </div>
+      <div class="card reveal">
+        <div class="table-wrap">
+        <table id="tbl"><thead><tr>
+          <th>Source</th><th>Destination</th><th>SSRC</th><th>Codec</th>
+          <th>Pkts</th><th>Start (IST)</th><th>Dur (s)</th><th>Action</th><th class="out-col">Output</th>
+        </tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </section>
+  </main>
 
 <script>
 let FILE_ID = null;
 const $ = s => document.querySelector(s);
+const REDUCE = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* Scroll-triggered reveals via the native IntersectionObserver — no animation libraries.
+   Elements with class "reveal" fade in and rise as they enter the viewport. */
+const io = (!REDUCE && 'IntersectionObserver' in window)
+  ? new IntersectionObserver((entries, obs) => {
+      for (const e of entries) if (e.isIntersecting) { e.target.classList.add('in'); obs.unobserve(e.target); }
+    }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' })
+  : null;
+function observeReveals() {
+  document.querySelectorAll('.reveal:not(.in)').forEach(el => io ? io.observe(el) : el.classList.add('in'));
+}
+
+/* Subtle hero parallax, throttled to a single rAF per frame. */
+const heroBg = $('#heroBg');
+if (heroBg && !REDUCE) {
+  let ticking = false;
+  addEventListener('scroll', () => {
+    if (ticking) return; ticking = true;
+    requestAnimationFrame(() => { heroBg.style.transform = 'translateY(' + (scrollY * 0.3) + 'px)'; ticking = false; });
+  }, { passive: true });
+}
 
 $('#up').onclick = async () => {
   const f = $('#file').files[0];
@@ -87,17 +214,20 @@ $('#up').onclick = async () => {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'upload failed');
     FILE_ID = d.file_id;
+    $('#result').style.display = '';
     renderStreams(d.streams);
     $('#status').textContent = d.streams.length + ' stream(s) found';
-    $('#result').style.display = '';
+    observeReveals();
   } catch (e) { $('#status').textContent = 'error: ' + e.message; }
   $('#up').disabled = false;
 };
 
 function renderStreams(streams) {
   const tb = $('#tbl tbody'); tb.innerHTML = '';
-  for (const s of streams) {
+  streams.forEach((s, i) => {
     const tr = document.createElement('tr');
+    tr.classList.add('reveal');
+    tr.style.transitionDelay = Math.min(i * 0.04, 0.4) + 's';   // gentle stagger
     const supported = ['AMR-NB','AMR-WB','G711u','G711a','H264','H265'].includes(s.codec);
     tr.innerHTML = `
       <td>${s.src_ip}:${s.src_port}</td>
@@ -105,11 +235,13 @@ function renderStreams(streams) {
       <td>${s.ssrc}</td>
       <td><span class="pill">${s.codec}</span></td>
       <td>${s.pkts}</td>
+      <td title="ends ${s.end_time||'?'}">${s.start_time||'—'}</td>
       <td>${s.duration}</td>
       <td></td><td class="out muted">—</td>`;
-    const act = tr.children[6], out = tr.children[7];
+    const act = tr.children[7], out = tr.children[8];
     if (supported) {
       const b = document.createElement('button');
+      b.className = 'btn-extract';
       b.textContent = 'Extract';
       b.onclick = () => extract(s, b, out);
       act.appendChild(b);
@@ -117,7 +249,8 @@ function renderStreams(streams) {
       act.innerHTML = '<span class="muted">unsupported</span>';
     }
     tb.appendChild(tr);
-  }
+  });
+  observeReveals();
 }
 
 async function extract(s, btn, out) {
@@ -131,16 +264,20 @@ async function extract(s, btn, out) {
     if (!r.ok) throw new Error(d.error || 'extract failed');
     if (d.kind === 'video') {
       out.innerHTML = `<a href="${d.download}" download>download</a> `
-        + `<span class="muted">(${d.frames} pkts, ${d.fps} fps)</span><br>`
-        + `<video controls preload="none" width="240" src="${d.download}"></video>`;
+        + `<span class="muted">(${d.frames} pkts, ${d.fps} fps)</span>`
+        + `<video controls preload="none" src="${d.download}"></video>`;
     } else {
       out.innerHTML = `<a href="${d.download}" download>download</a> `
-        + `<span class="muted">(${d.duration_s}s${d.gaps_filled_s?(', '+d.gaps_filled_s+'s silence'):''})</span><br>`
+        + `<span class="muted">(${d.duration_s}s${d.gaps_filled_s?(', '+d.gaps_filled_s+'s silence'):''})</span>`
         + `<audio controls preload="none" src="${d.download}"></audio>`;
     }
+    // reveal the player even when the wide table is horizontally scrolled
+    out.scrollIntoView({ behavior: REDUCE ? 'auto' : 'smooth', block: 'nearest', inline: 'end' });
   } catch (e) { out.innerHTML = '<span class="warn">'+e.message+'</span>'; }
   btn.disabled = false; btn.textContent = old;
 }
+
+observeReveals();   // reveal the hero on first paint
 </script>
 </body></html>
 """

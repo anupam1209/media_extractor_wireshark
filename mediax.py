@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import wave
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 
 TSHARK = "tshark"
 FFMPEG = "ffmpeg"
@@ -45,6 +46,16 @@ AUDIO_CODECS = {"AMR-NB", "AMR-WB", "G711u", "G711a"}
 VIDEO_CODECS = {"H264", "H265"}          # depacketize + remux supported (VP8 = detect-only)
 SUPPORTED = AUDIO_CODECS | VIDEO_CODECS
 START_CODE = b"\x00\x00\x00\x01"         # Annex-B NAL unit separator
+
+
+IST = timezone(timedelta(hours=5, minutes=30))   # India Standard Time (no DST)
+
+
+def _fmt_ist(epoch):
+    """Format a Unix epoch (UTC seconds) as a human-readable IST wall-clock string."""
+    if not epoch:
+        return None
+    return datetime.fromtimestamp(epoch, IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
 class MediaxError(Exception):
@@ -109,7 +120,7 @@ def detect_streams(pcap):
     out = _run(
         [TSHARK, "-r", pcap, "-o", "rtp.heuristic_rtp:TRUE", "-Y", "rtp", "-T", "fields",
          "-e", "ip.src", "-e", "udp.srcport", "-e", "ip.dst", "-e", "udp.dstport",
-         "-e", "udp.payload", "-e", "frame.time_relative"],
+         "-e", "udp.payload", "-e", "frame.time_relative", "-e", "frame.time_epoch"],
     ).stdout
     agg = {}
     for line in out.splitlines():
@@ -127,6 +138,7 @@ def detect_streams(pcap):
             ts = int(up[8:16], 16)
             ssrc = int(up[16:24], 16)
             t = float(f[5]) if f[5] else 0.0
+            epoch = float(f[6]) if len(f) > 6 and f[6] else 0.0   # absolute wall-clock (UTC)
         except ValueError:
             continue
         size = len(up) // 2 - 12                  # approx payload size (ignores CSRC/extension)
@@ -135,6 +147,7 @@ def detect_streams(pcap):
         if d is None:
             d = agg[key] = {"pt": pt, "pkts": 0, "sizes": Counter(),
                             "deltas": Counter(), "last_ts": None, "t0": t, "t1": t,
+                            "epoch0": epoch, "epoch1": epoch,
                             "max_size": 0, "same_ts": 0, "sample": None}
         d["pkts"] += 1
         if size > 0:
@@ -151,6 +164,8 @@ def detect_streams(pcap):
                 d["deltas"][delta] += 1
         d["last_ts"] = ts
         d["t1"] = t
+        if epoch:
+            d["epoch1"] = epoch
 
     streams = []
     for (sip, sport, dip, dport, ssrc), d in agg.items():
@@ -161,6 +176,8 @@ def detect_streams(pcap):
             "max_size": d["max_size"], "same_ts": d["same_ts"],
             "ts_delta": d["deltas"].most_common(1)[0][0] if d["deltas"] else None,
             "duration": round(d["t1"] - d["t0"], 2),
+            "start_epoch": d["epoch0"], "end_epoch": d["epoch1"],
+            "start_time": _fmt_ist(d["epoch0"]), "end_time": _fmt_ist(d["epoch1"]),
         }
         s["codec"], s["wideband"], s["mode"] = classify(s)
         if s["codec"] == "video":                 # refine to H264/H265 from the actual NAL header
@@ -703,12 +720,12 @@ def main():
             print(json.dumps(streams, indent=2))
         else:
             print(f"{'src':>22} {'dst':>22} {'ssrc':>11} {'pt':>4} {'pkts':>6} "
-                  f"{'sz':>3} {'dur':>6}  codec")
+                  f"{'sz':>3} {'dur':>6}  {'start (IST)':<23} codec")
             for s in streams:
                 print(f'{s["src_ip"]+":"+str(s["src_port"]):>22} '
                       f'{s["dst_ip"]+":"+str(s["dst_port"]):>22} {s["ssrc"]:>11} '
                       f'{s["pt"]:>4} {s["pkts"]:>6} {str(s["mode_size"]):>3} '
-                      f'{s["duration"]:>6}  {s["codec"]}')
+                      f'{s["duration"]:>6}  {(s["start_time"] or "-"):<23} {s["codec"]}')
         return
 
     if args.cmd == "extract":
