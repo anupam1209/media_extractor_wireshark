@@ -223,6 +223,13 @@ suppression). There are two ways to rebuild such audio:
 For a stream with silence gaps, *real timing* produces a longer file (e.g. 43.5 s) than
 *compact* (e.g. 26.8 s). For a continuous stream with no gaps the two are identical.
 
+Real timing anchors each frame to its **packet arrival time** (capture wall-clock), not the
+RTP media timestamp. Conference mixers sometimes emit broken per-stream RTP timestamps within a
+single SSRC — they reset backwards, run ahead of real time, or run behind it — which would
+otherwise crash extraction or fabricate hours of bogus silence. Anchoring to arrival time keeps
+the output faithful to the real capture length regardless, while still placing every frame in its
+own slot so nothing is dropped.
+
 ---
 
 ## Supported codecs
@@ -278,8 +285,13 @@ differences don't cause false failures. A correlation near **1.0** means the aud
      aggregation, and fragmentation) into an Annex-B elementary stream.
 3. **Decode / mux** — audio `.amr` is decoded by GStreamer's `amrnbdec`/`amrwbdec` (or ffmpeg),
    G.711 by ffmpeg; video is remuxed into MP4 with ffmpeg `-c copy` (no re-encode).
-4. **Reconstruct** (audio) — decoded frames are placed on the real timeline using RTP timestamps,
-   filling silence gaps (or concatenated, in compact mode), and written as WAV.
+4. **Reconstruct** (audio) — decoded frames are placed on the real timeline using packet
+   arrival time (robust to broken RTP media clocks), filling silence gaps (or concatenated, in
+   compact mode), and written as WAV.
+
+If any step fails, the tool reports the actual reason — the underlying `tshark`/`ffmpeg`/GStreamer
+error message in the CLI, or a JSON `{"error": "..."}` in the web app — instead of failing
+silently.
 
 ---
 

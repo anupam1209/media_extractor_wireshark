@@ -47,6 +47,26 @@ SUPPORTED = AUDIO_CODECS | VIDEO_CODECS
 START_CODE = b"\x00\x00\x00\x01"         # Annex-B NAL unit separator
 
 
+class MediaxError(Exception):
+    """Extraction/detection failure with a human-readable reason. Raised instead of
+    SystemExit so callers (CLI and web app) can catch it and report the actual cause
+    rather than failing silently."""
+
+
+def _run(cmd, **kw):
+    """Run a subprocess, capturing output. On non-zero exit, raise MediaxError carrying the
+    tool's own error message (last line of stderr/stdout) so failures are never silent."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except FileNotFoundError:
+        raise MediaxError(f"required tool not found: {cmd[0]} (is it installed and on PATH?)")
+    if r.returncode != 0:
+        lines = [ln for ln in (r.stderr or r.stdout or "").splitlines() if ln.strip()]
+        reason = lines[-1].strip() if lines else f"exit code {r.returncode}"
+        raise MediaxError(f"{os.path.basename(cmd[0])} failed: {reason}")
+    return r
+
+
 # --------------------------------------------------------------------------- #
 # RTP parsing — we parse the RTP header/payload ourselves from the raw UDP
 # payload (`udp.payload`) instead of relying on tshark's `rtp.payload` field.
@@ -86,11 +106,10 @@ def parse_rtp(buf):
 def detect_streams(pcap):
     """Return one dict per RTP stream with topology, packet count, modal payload size,
     modal timestamp delta, duration, and a codec guess. Robust to multi-word payload names."""
-    out = subprocess.run(
+    out = _run(
         [TSHARK, "-r", pcap, "-o", "rtp.heuristic_rtp:TRUE", "-Y", "rtp", "-T", "fields",
          "-e", "ip.src", "-e", "udp.srcport", "-e", "ip.dst", "-e", "udp.dstport",
          "-e", "udp.payload", "-e", "frame.time_relative"],
-        capture_output=True, text=True,
     ).stdout
     agg = {}
     for line in out.splitlines():
@@ -275,19 +294,21 @@ def depacketize_oa(payload, wideband=False):
 # Payload extraction + decode
 # --------------------------------------------------------------------------- #
 def get_rtp_payloads_ts(pcap, s):
-    """[(timestamp, payload)] for one stream (by 5-tuple + SSRC), ordered by sequence number.
-    Payloads are parsed from the raw UDP bytes so results are identical across tshark versions."""
+    """[(rtp_ts, arrival_s, payload)] for one stream (by 5-tuple + SSRC), ordered by sequence
+    number. `arrival_s` is the packet's capture wall-clock time (frame.time_relative), used to
+    sanity-check the RTP media clock. Payloads are parsed from the raw UDP bytes so results are
+    identical across tshark versions."""
     flt = (f'ip.src=={s["src_ip"]} && udp.srcport=={s["src_port"]} && '
            f'ip.dst=={s["dst_ip"]} && udp.dstport=={s["dst_port"]} && '
            f'rtp.ssrc=={s["ssrc"]} && rtp')
-    out = subprocess.run(
+    out = _run(
         [TSHARK, "-r", pcap, "-o", "rtp.heuristic_rtp:TRUE", "-Y", flt,
-         "-T", "fields", "-e", "udp.payload"],
-        capture_output=True, text=True,
+         "-T", "fields", "-e", "udp.payload", "-e", "frame.time_relative"],
     ).stdout
     rows, seen = [], set()
     for line in out.splitlines():
-        h = line.strip().replace(":", "")
+        f = line.split("\t")
+        h = f[0].strip().replace(":", "")
         if not h:
             continue
         r = parse_rtp(bytes.fromhex(h))
@@ -297,14 +318,18 @@ def get_rtp_payloads_ts(pcap, s):
         if key in seen:
             continue
         seen.add(key)
-        rows.append((r["seq"], r["ts"], r["payload"]))
+        try:
+            arr = float(f[1]) if len(f) > 1 and f[1] else 0.0
+        except ValueError:
+            arr = 0.0
+        rows.append((r["seq"], r["ts"], arr, r["payload"]))
     rows.sort(key=lambda r: r[0])      # by sequence number
-    return [(ts, pl) for _, ts, pl in rows]
+    return [(ts, arr, pl) for _, ts, arr, pl in rows]
 
 
 def get_rtp_payloads(pcap, s):
     """RTP payloads for one stream, ordered by sequence number."""
-    return [pl for _, pl in get_rtp_payloads_ts(pcap, s)]
+    return [pl for _, _, pl in get_rtp_payloads_ts(pcap, s)]
 
 
 def _unwrap_ts(ts_list):
@@ -318,18 +343,30 @@ def _unwrap_ts(ts_list):
     return out
 
 
-def reconstruct_timed(samples, frame_counts, ts_list):
-    """Place each frame's decoded samples at its RTP-timestamp offset, filling DTX gaps with
-    silence. RTP audio timestamps are in sample units, so (ts - ts0) is the sample offset."""
-    ts = _unwrap_ts(ts_list)
-    ts0 = ts[0]
-    total = (ts[-1] - ts0) + frame_counts[-1]
-    buf = array.array("h", bytes(2 * total))  # zero-filled (silence)
+def reconstruct_timed(samples, frame_counts, ts_list, arr_list, rate):
+    """Place each frame's decoded samples on the real timeline, filling silence/DTX gaps.
+
+    The timeline is anchored to packet ARRIVAL time (frame.time_relative): frame i starts at
+    (arrival_i - arrival_0) * rate. Arrival time never resets and reflects true elapsed wall-clock,
+    so the output stays faithful even when a stream's RTP media clock is broken inside one SSRC --
+    all seen in these conference captures: a backward reset (e.g. a mixer pre-roll), a clock that
+    runs *ahead* of real time (phantom forward jumps that would otherwise fabricate hours of
+    silence), and one that runs *behind* (under-counting gaps). Each frame is still guaranteed its
+    own slot (the offset advances by at least one frame), so capture bursts never overwrite/drop
+    audio. If arrival times are unavailable, fall back to the RTP timestamp."""
+    have_wall = bool(arr_list) and any(arr_list)
+    ref = arr_list if have_wall else [t / rate for t in _unwrap_ts(ts_list)]  # seconds
+    ref0 = ref[0]
+    offsets = [0]
+    for i in range(1, len(ref)):
+        pos_i = int(round((ref[i] - ref0) * rate))
+        offsets.append(max(offsets[i - 1] + frame_counts[i - 1], pos_i))  # never overlap a frame
+    total = offsets[-1] + frame_counts[-1]
+    buf = array.array("h", bytes(2 * total))     # zero-filled (silence)
     pos = 0
-    for fc, t in zip(frame_counts, ts):
+    for fc, off in zip(frame_counts, offsets):
         chunk = samples[pos:pos + fc]
         pos += fc
-        off = max(0, t - ts0)
         end = min(off + len(chunk), total)
         if end > off:
             buf[off:end] = chunk[:end - off]
@@ -362,8 +399,8 @@ def decode_amr(amr_path, out_wav, wideband):
         r = subprocess.run(["gst-launch-1.0", "-e", *pipe.split()], capture_output=True)
         if r.returncode == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 44:
             return "gstreamer:" + dec
-    subprocess.run([FFMPEG, "-y", "-v", "error", "-i", amr_path,
-                    "-ar", str(rate), "-ac", "1", out_wav], check=True)
+    _run([FFMPEG, "-y", "-v", "error", "-i", amr_path,
+          "-ar", str(rate), "-ac", "1", out_wav])
     return "ffmpeg:native"
 
 
@@ -447,20 +484,20 @@ def extract_video(pcap, s, out_path, codec):
     """Depacketize a video stream to Annex-B, then remux to MP4 (no re-encode)."""
     rows = get_rtp_payloads_ts(pcap, s)
     if not rows:
-        raise SystemExit("no RTP payloads matched the stream")
-    payloads = [p for _, p in rows]
-    fps = _video_fps([t for t, _ in rows])
+        raise MediaxError("no RTP payloads matched the stream")
+    payloads = [r[2] for r in rows]
+    fps = _video_fps([r[0] for r in rows])
     if codec == "H264":
         es, demux, suffix = depacketize_h264(payloads), "h264", ".h264"
     elif codec == "H265":
         es, demux, suffix = depacketize_h265(payloads), "hevc", ".h265"
     else:
-        raise SystemExit(f"video codec '{codec}' is detect-only (extraction not implemented)")
+        raise MediaxError(f"video codec '{codec}' is detect-only (extraction not implemented)")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
         tf.write(es)
         raw_path = tf.name
-    subprocess.run([FFMPEG, "-y", "-v", "error", "-r", str(fps),
-                    "-f", demux, "-i", raw_path, "-c", "copy", out_path], check=True)
+    _run([FFMPEG, "-y", "-v", "error", "-r", str(fps),
+          "-f", demux, "-i", raw_path, "-c", "copy", out_path])
     os.unlink(raw_path)
     info = {"frames": len(payloads), "decoder": "ffmpeg:remux", "kind": "video",
             "container": "mp4", "fps": fps,
@@ -481,14 +518,15 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
     if codec in VIDEO_CODECS:
         return extract_video(pcap, s, out_path, codec)
     if codec not in AUDIO_CODECS:
-        raise SystemExit(f"unsupported codec '{codec}' for this stream (override with --codec)")
+        raise MediaxError(f"unsupported codec '{codec}' for this stream (override with --codec)")
 
     out_wav = out_path
     rows = get_rtp_payloads_ts(pcap, s)
     if not rows:
-        raise SystemExit("no RTP payloads matched the stream")
-    ts_list = [t for t, _ in rows]
-    payloads = [p for _, p in rows]
+        raise MediaxError("no RTP payloads matched the stream")
+    ts_list = [r[0] for r in rows]
+    arr_list = [r[1] for r in rows]
+    payloads = [r[2] for r in rows]
     rate = 16000 if wideband else 8000
 
     # 1) decode received frames to a concatenated PCM stream + per-frame sample counts
@@ -498,8 +536,8 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
             tf.write(b"".join(payloads))
             raw_path = tf.name
-        subprocess.run([FFMPEG, "-y", "-v", "error", "-f", fmt, "-ar", "8000",
-                        "-ac", "1", "-i", raw_path, tmp_wav], check=True)
+        _run([FFMPEG, "-y", "-v", "error", "-f", fmt, "-ar", "8000",
+              "-ac", "1", "-i", raw_path, tmp_wav])
         os.unlink(raw_path)
         decoder = "ffmpeg:" + fmt
         frame_counts = [len(p) for p in payloads]
@@ -523,7 +561,7 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
     info = {"frames": len(payloads), "decoder": decoder, "timing": timing}
     expected = sum(frame_counts)
     if timing == "accurate" and len(samples) == expected:
-        buf = reconstruct_timed(samples, frame_counts, ts_list)
+        buf = reconstruct_timed(samples, frame_counts, ts_list, arr_list, rate)
         info["gaps_filled_s"] = round((len(buf) - expected) / sr, 2)
     else:
         if timing == "accurate" and len(samples) != expected:
@@ -561,8 +599,8 @@ def extract_all(pcap, out_dir, min_pkts=20, timing="accurate"):
 # --------------------------------------------------------------------------- #
 def to_canonical_wav(path, rate):
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    subprocess.run([FFMPEG, "-y", "-v", "error", "-i", path, "-ar", str(rate),
-                    "-ac", "1", "-f", "wav", tmp], check=True)
+    _run([FFMPEG, "-y", "-v", "error", "-i", path, "-ar", str(rate),
+          "-ac", "1", "-f", "wav", tmp])
     return tmp
 
 
@@ -698,4 +736,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except MediaxError as e:
+        raise SystemExit(f"error: {e}")
