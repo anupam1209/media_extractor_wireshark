@@ -9,7 +9,7 @@ services:
     runtime: docker          # build/run from ./Dockerfile (not a native buildpack)
     plan: free               # bump to "starter" if large PCAPs exhaust the 512 MB free RAM
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /        # GET / returns the app's HTML page (HTTP 200)
+    healthCheckPath: /healthz # unauthenticated health endpoint (GET / needs auth once enabled)
     autoDeploy: true          # redeploy automatically on every push to the branch
     # Render injects $PORT automatically; the container already binds it.
     # Set these in the Render dashboard (Environment tab) to password-protect the

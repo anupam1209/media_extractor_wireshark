@@ -327,9 +327,11 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- GET: page + download -------------------------------------------- #
     def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/healthz":   # unauthenticated so Render's health check passes
+            return self._send(200, {"status": "ok"})
         if not self._authed():
             return
-        u = urlparse(self.path)
         if u.path == "/":
             return self._send(200, PAGE, "text/html; charset=utf-8")
         if u.path == "/api/download":
