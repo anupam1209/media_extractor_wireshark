@@ -34,7 +34,7 @@ hear silence at exactly that point.
 
 ## What it can do
 
-- **Auto-detect** every RTP stream in a capture (source/destination, SSRC, packet count, duration).
+- **Auto-detect** every RTP stream in a capture (source/destination, SSRC, packet count, duration, and the call's wall-clock start time in IST).
 - **Auto-identify the codec** with no manual config — audio (AMR-NB, AMR-WB, G.711 µ-law/A-law) and video (H.264, H.265).
 - **Extract & decode** each stream: audio to `.wav`, video to `.mp4` (remuxed, no re-encode).
 - **Preserve real timing** (audio) — silence is inserted where the audio actually dropped (great for mute analysis).
@@ -143,13 +143,18 @@ Maximum upload size is 500 MB.
 python3 mediax.py detect <pcap> [--json]
 ```
 Prints one row per RTP stream with source, destination, SSRC, payload type, packet count,
-modal payload size, duration, and the guessed codec. Add `--json` for machine-readable output.
+modal payload size, duration, the **call start time in IST**, and the guessed codec. Add
+`--json` for machine-readable output (which also includes `start_time`, `end_time`,
+`start_epoch`, and `end_epoch`).
 
 ```
-                   src                    dst        ssrc   pt   pkts  sz    dur  codec
-      10.63.5.25:16152      10.44.139.5:15288  0x133FA82D  118   2200  32  41.83  AMR-NB
-     10.44.139.5:15298      10.63.5.203:8100  0x82D8D370   98    217  61   6.18  AMR-WB
+                   src                    dst        ssrc   pt   pkts  sz    dur  start (IST)             codec
+      10.63.5.25:16152      10.44.139.5:15288  0x133FA82D  118   2200  32  41.83  2026-06-23 09:41:27 IST AMR-NB
+     10.44.139.5:15298      10.63.5.203:8100  0x82D8D370   98    217  61   6.18  2026-06-23 09:41:27 IST AMR-WB
 ```
+
+The start/end time is the packet's absolute capture time (`frame.time_epoch`) converted to
+India Standard Time (UTC+5:30), so you can see *when* each call actually took place.
 
 ### `extract` — one stream to WAV
 ```bash
@@ -223,6 +228,13 @@ suppression). There are two ways to rebuild such audio:
 For a stream with silence gaps, *real timing* produces a longer file (e.g. 43.5 s) than
 *compact* (e.g. 26.8 s). For a continuous stream with no gaps the two are identical.
 
+Real timing anchors each frame to its **packet arrival time** (capture wall-clock), not the
+RTP media timestamp. Conference mixers sometimes emit broken per-stream RTP timestamps within a
+single SSRC — they reset backwards, run ahead of real time, or run behind it — which would
+otherwise crash extraction or fabricate hours of bogus silence. Anchoring to arrival time keeps
+the output faithful to the real capture length regardless, while still placing every frame in its
+own slot so nothing is dropped.
+
 ---
 
 ## Supported codecs
@@ -278,8 +290,13 @@ differences don't cause false failures. A correlation near **1.0** means the aud
      aggregation, and fragmentation) into an Annex-B elementary stream.
 3. **Decode / mux** — audio `.amr` is decoded by GStreamer's `amrnbdec`/`amrwbdec` (or ffmpeg),
    G.711 by ffmpeg; video is remuxed into MP4 with ffmpeg `-c copy` (no re-encode).
-4. **Reconstruct** (audio) — decoded frames are placed on the real timeline using RTP timestamps,
-   filling silence gaps (or concatenated, in compact mode), and written as WAV.
+4. **Reconstruct** (audio) — decoded frames are placed on the real timeline using packet
+   arrival time (robust to broken RTP media clocks), filling silence gaps (or concatenated, in
+   compact mode), and written as WAV.
+
+If any step fails, the tool reports the actual reason — the underlying `tshark`/`ffmpeg`/GStreamer
+error message in the CLI, or a JSON `{"error": "..."}` in the web app — instead of failing
+silently.
 
 ---
 

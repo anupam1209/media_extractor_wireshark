@@ -15,7 +15,8 @@
       "Bash(tshark -r wiresharks/filtered_16152_to_15288.pcap -o rtp.heuristic_rtp:TRUE -Y 'ip.src==10.63.5.25 && udp.srcport==16152 && rtp' -T fields -e rtp.payload)",
       "Bash(awk '{print length\\($0\\)/2}')",
       "Bash(ffmpeg -hide_banner -v error -i AP_MUTE_ISSUE/filtered_16152_to_15288.avi -af astats=metadata=1 -f null -)",
-      "Bash(ffmpeg -hide_banner -v error -i /tmp/poc_out.avi -af astats=metadata=1 -f null -)"
+      "Bash(ffmpeg -hide_banner -v error -i /tmp/poc_out.avi -af astats=metadata=1 -f null -)",
+      "Bash(git fetch *)"
     ]
   }
 }

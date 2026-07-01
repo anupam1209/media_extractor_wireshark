@@ -8,3 +8,11 @@ __pycache__/
 # OS junk
 .DS_Store
 **/.DS_Store
+
+# Sample captures: keep NEW/untracked ones out of git. GitHub hard-rejects any
+# file > 100 MB (e.g. wiresharks/video_hold_new.pcap is 202 MB,
+# confmedia-voice-not-okay-29th-June.pcap is 176 MB), which would make the whole
+# push fail. The reference captures already committed here stay tracked; this only
+# stops new untracked captures from being added. Use Git LFS to version big ones.
+wiresharks/*.pcap
+wiresharks/*.pcapng
