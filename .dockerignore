@@ -1,0 +1,27 @@
+# Keep the Docker build context tiny and the image clean.
+# Without this, the builder would try to ship ~3 GB of local data.
+# NOTE: .dockerignore only supports whole-line comments (no inline # comments).
+
+# Version control / tooling / editor + OS junk
+.git
+.gitignore
+.dockerignore
+.claude
+__pycache__
+**/__pycache__
+*.pyc
+.DS_Store
+**/.DS_Store
+
+# Large local-only data — not needed at runtime (users upload their own pcaps).
+# _work/ ~2.6 GB (runtime uploads+output), wiresharks/ ~522 MB (samples),
+# AP_MUTE_ISSUE/ ~98 MB (reference material).
+_work/
+wiresharks/
+AP_MUTE_ISSUE/
+
+# Docs / deploy config not needed inside the image.
+DEPLOY.md
+README.md
+render.yaml
+Dockerfile

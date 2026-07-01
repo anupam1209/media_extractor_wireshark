@@ -1,0 +1,14 @@
+# Render Blueprint — lets you deploy straight from GitHub with one click.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# In the Render dashboard:  New +  ->  Blueprint  ->  connect this repo.
+# Render reads this file, builds the Dockerfile, and hosts the result.
+services:
+  - type: web
+    name: pcap-media-extractor
+    runtime: docker          # build/run from ./Dockerfile (not a native buildpack)
+    plan: free               # bump to "starter" if large PCAPs exhaust the 512 MB free RAM
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /        # GET / returns the app's HTML page (HTTP 200)
+    autoDeploy: true          # redeploy automatically on every push to the branch
+    # Render injects $PORT automatically; the container already binds it.

@@ -381,7 +381,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Web UI for the PCAP RTP media extractor")
     ap.add_argument("--host", default=os.environ.get("MEDIAX_HOST", HOST),
                     help="bind address (use 0.0.0.0 to expose on the VM)")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("MEDIAX_PORT", PORT)))
+    ap.add_argument("--port", type=int,
+                    default=int(os.environ.get("MEDIAX_PORT") or os.environ.get("PORT") or PORT),
+                    help="listen port (honours $PORT, set by Render/Railway/Cloud Run/Fly)")
     args = ap.parse_args()
     print(f"PCAP RTP Media Extractor  ->  http://{args.host}:{args.port}")
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
