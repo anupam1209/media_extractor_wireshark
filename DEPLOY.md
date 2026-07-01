@@ -48,10 +48,31 @@ That's it. Every later `git push` redeploys automatically (`autoDeploy: true`).
 - **Storage is ephemeral:** uploads and extracted files live under `_work/` and
   are wiped on restart/redeploy. That's fine — the browser downloads each
   extracted clip immediately; nothing needs to persist server-side.
-- **It's public:** anyone with the URL can upload a pcap and trigger processing
-  (which runs `tshark`/`ffmpeg` on your instance). If this isn't meant to be
-  open, keep the URL private, or put it behind Render's access controls / add a
-  simple auth check before exposing it widely.
+- **It's public by default:** anyone with the URL can upload a pcap and trigger
+  processing on your instance. See **Make it private** below to lock it down.
+
+---
+
+## Make it private (HTTP Basic Auth)
+
+Password protection is built into the app — no extra service needed. Turn it on by
+setting two environment variables on Render:
+
+1. Render dashboard → your service → **Environment** → **Add Environment Variable**:
+   - `MEDIAX_USER` = a username you choose
+   - `MEDIAX_PASS` = a password you choose
+2. **Save** — Render redeploys automatically (~1–2 min).
+
+After that, every visit (page + all API calls) requires those credentials: the
+browser shows a native login prompt, and wrong/missing credentials get a `401`.
+If either variable is unset, the app stays open (handy for local dev).
+
+`render.yaml` already declares these two vars with `sync: false`, so Render knows
+about them while the secret values live only in the dashboard, never in git.
+
+> This is app-level auth over HTTPS (Render terminates TLS for `*.onrender.com`),
+> which is enough to keep the tool private. Render's IP-allowlist / private-network
+> options are paid-plan features; Basic Auth works on the free tier.
 
 ---
 

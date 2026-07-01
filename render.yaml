@@ -12,3 +12,10 @@ services:
     healthCheckPath: /        # GET / returns the app's HTML page (HTTP 200)
     autoDeploy: true          # redeploy automatically on every push to the branch
     # Render injects $PORT automatically; the container already binds it.
+    # Set these in the Render dashboard (Environment tab) to password-protect the
+    # site with HTTP Basic Auth. sync:false keeps the secret values OUT of git.
+    envVars:
+      - key: MEDIAX_USER
+        sync: false
+      - key: MEDIAX_PASS
+        sync: false

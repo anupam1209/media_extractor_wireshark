@@ -7,6 +7,8 @@ Run:  python3 webapp.py   then open  http://127.0.0.1:8000
 
 Flow:  upload PCAP  ->  auto-detected streams table  ->  Extract (per stream)  ->  download/preview WAV
 """
+import base64
+import hmac
 import json
 import os
 import re
@@ -300,8 +302,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---- optional HTTP Basic Auth (set MEDIAX_USER + MEDIAX_PASS to enable) - #
+    def _authed(self):
+        """Return True if the request may proceed. If MEDIAX_USER and MEDIAX_PASS
+        are both set, require matching HTTP Basic credentials; otherwise the app
+        stays open (convenient for local dev)."""
+        user = os.environ.get("MEDIAX_USER")
+        pw = os.environ.get("MEDIAX_PASS")
+        if not user or not pw:            # no credentials configured -> open
+            return True
+        hdr = self.headers.get("Authorization", "")
+        if hdr.startswith("Basic "):
+            try:
+                got = base64.b64decode(hdr[6:]).decode("utf-8", "replace")
+            except Exception:
+                got = ""
+            u, _, p = got.partition(":")
+            if (hmac.compare_digest(u.encode(), user.encode())
+                    and hmac.compare_digest(p.encode(), pw.encode())):
+                return True
+        self._send(401, {"error": "authentication required"},
+                   extra={"WWW-Authenticate": 'Basic realm="PCAP Media Extractor"'})
+        return False
+
     # ---- GET: page + download -------------------------------------------- #
     def do_GET(self):
+        if not self._authed():
+            return
         u = urlparse(self.path)
         if u.path == "/":
             return self._send(200, PAGE, "text/html; charset=utf-8")
@@ -320,6 +347,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- POST: upload + extract ------------------------------------------ #
     def do_POST(self):
+        if not self._authed():
+            return
         u = urlparse(self.path)
         try:
             if u.path == "/api/upload":
