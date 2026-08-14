@@ -127,8 +127,11 @@ def detect_streams(pcap):
         f = line.split("\t")
         if len(f) < 6 or not f[1] or not f[3]:
             continue
-        # tunneled/fragmented packets can yield comma-joined fields; take the first value
-        f = [c.split(",")[0] for c in f]
+        # Tunneled packets (e.g. GTP-U: outer IP/UDP -> GTP -> inner IP/UDP -> RTP)
+        # make tshark emit one value per protocol layer, comma-joined outer->inner.
+        # The media always rides the INNERMOST IP/UDP, so take the last value. An
+        # untunneled packet has a single value, so [-1] == [0] and nothing changes.
+        f = [c.split(",")[-1] for c in f]
         up = f[4].replace(":", "")
         if len(up) < 24:                          # need at least a 12-byte RTP header
             continue
@@ -325,7 +328,10 @@ def get_rtp_payloads_ts(pcap, s):
     rows, seen = [], set()
     for line in out.splitlines():
         f = line.split("\t")
-        h = f[0].strip().replace(":", "")
+        # Innermost udp.payload = the RTP packet (see detect_streams): a GTP-tunneled
+        # capture makes tshark emit the outer (GTP) and inner (RTP) UDP payloads
+        # comma-joined, and only the inner one is the RTP we want to parse.
+        h = f[0].split(",")[-1].strip().replace(":", "")
         if not h:
             continue
         r = parse_rtp(bytes.fromhex(h))

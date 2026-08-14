@@ -16,3 +16,7 @@ __pycache__/
 # stops new untracked captures from being added. Use Git LFS to version big ones.
 wiresharks/*.pcap
 wiresharks/*.pcapng
+
+
+#directories to be ignored
+documentation/
