@@ -1,5 +1,10 @@
-# Runtime working dir (uploads + extracted outputs)
+# Runtime working dir (uploads + extracted outputs + debug logs from `webapp.py --debug`)
 _work/
+
+# Debug logs — belt-and-braces. _work/ above already covers _work/logs/, but these
+# keep logs out of git even if the work dir is ever moved or renamed.
+logs/
+*.log
 
 # Python bytecode
 __pycache__/

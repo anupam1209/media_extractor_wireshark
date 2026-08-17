@@ -29,6 +29,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import wave
 from collections import Counter
@@ -46,6 +47,120 @@ AUDIO_CODECS = {"AMR-NB", "AMR-WB", "G711u", "G711a"}
 VIDEO_CODECS = {"H264", "H265"}          # depacketize + remux supported (VP8 = detect-only)
 SUPPORTED = AUDIO_CODECS | VIDEO_CODECS
 START_CODE = b"\x00\x00\x00\x01"         # Annex-B NAL unit separator
+
+
+# --------------------------------------------------------------------------- #
+# Debug tracing — watch the pipeline run, step by step.
+#
+# Three ways to turn it on, in increasing order of convenience:
+#   1. flip DEBUG to True below              (always on, no flags needed)
+#   2. MEDIAX_DEBUG=1 python3 mediax.py ...  (env var, one run)
+#   3. python3 mediax.py detect x.pcap --debug
+#
+# Narrow the firehose by tag, e.g. only the silence-gap report:
+#   MEDIAX_DEBUG=gap,timeline python3 mediax.py extract ...
+#   python3 mediax.py extract ... --debug --debug-tags gap,timeline
+#
+# Tags, roughly in the order they fire:
+#   detect    tshark invocation + how many packets/streams came back
+#   tunnel    multi-layer (GTP-U) packets, showing the innermost values kept
+#   packet    one line per RTP packet as it is aggregated
+#   rtp       parse_rtp() header decode (and rejects)
+#   classify  the codec verdict for a stream, with the evidence behind it
+#   payloads  per-stream tshark filter + dedup result
+#   amr       RTP AMR depacketization (frame types per packet)
+#   decode    which decoder actually ran (GStreamer vs ffmpeg)
+#   extract   the numbered milestones of extract_stream()
+#   timeline  real-timeline reconstruction summary
+#   gap       every silence gap over 200 ms, with its position
+#   web       webapp.py upload/extract requests
+#
+# `limit` caps how many times a tag may print, so per-packet call sites cannot
+# flood the terminal. Counters reset at the start of each detect/extract.
+# --------------------------------------------------------------------------- #
+DEBUG = False        # master switch: set True to trace every run
+TRACE_TAGS = None    # None = all tags; or a set of tag names to show
+GAP_REPORT_S = 0.2   # [gap] narrates silences longer than this many seconds
+LOC_WIDTH = 16       # column width for the "file.py:NN" location prefix
+_trace_counts = Counter()
+_trace_sink = None   # optional file object; trace() mirrors every line here (webapp --debug)
+
+
+def set_trace_sink(fh):
+    """Mirror every trace line to an open file object, timestamped. Pass None to stop.
+    webapp.py uses this to tee the trace into _work/logs/ while still printing to stdout."""
+    global _trace_sink
+    _trace_sink = fh
+
+
+def set_debug(on=True, tags=None):
+    """Turn tracing on/off at runtime. `tags` limits output to those tag names."""
+    global DEBUG, TRACE_TAGS
+    DEBUG = bool(on)
+    TRACE_TAGS = set(tags) if tags else None
+    _trace_counts.clear()
+
+
+def trace_reset():
+    """Give every tag a fresh print budget (called at the start of each operation)."""
+    _trace_counts.clear()
+
+
+def tracing(tag):
+    """True if `tag` would currently print. Guard trace-only bookkeeping with this so it
+    costs nothing when tracing is off (see the gap accounting in reconstruct_timed)."""
+    return DEBUG and (TRACE_TAGS is None or tag in TRACE_TAGS)
+
+
+def trace(tag, msg, limit=None):
+    """Print one pipeline step when tracing is on. No-op (and near-free) when off."""
+    if not tracing(tag):
+        return
+    _trace_counts[tag] += 1
+    n = _trace_counts[tag]
+    if limit is not None and n > limit:
+        return
+    where = _caller()
+    _emit(tag, msg, where)
+    if limit is not None and n == limit:
+        _emit(tag, f"...further [{tag}] lines suppressed (limit {limit})", where)
+
+
+def _caller(depth=2):
+    """'file.py:NN' of the code that called trace(). depth 2 skips _caller and trace
+    itself, so the location points at the pipeline step, not at this helper. Only ever
+    runs while tracing is on, so the frame walk costs nothing on a normal run."""
+    try:
+        f = sys._getframe(depth)
+        return f"{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}"
+    except (ValueError, AttributeError):
+        return "?"
+
+
+def _emit(tag, msg, where):
+    """Write one trace line to stdout, and to the log file if one is attached."""
+    print(f"  {where:<{LOC_WIDTH}} [{tag}] {msg}", flush=True)
+    if _trace_sink is not None:
+        try:
+            stamp = f"{datetime.now():%H:%M:%S.%f}"[:-3]
+            _trace_sink.write(f"{stamp} {where:<{LOC_WIDTH}} [{tag}] {msg}\n")
+            _trace_sink.flush()
+        except (ValueError, OSError):     # sink closed/unwritable -> keep tracing to stdout
+            pass
+
+
+def _debug_from_env():
+    """MEDIAX_DEBUG=1 (all tags) or MEDIAX_DEBUG=gap,classify (those tags only)."""
+    v = (os.environ.get("MEDIAX_DEBUG") or "").strip()
+    if not v or v.lower() in ("0", "false", "no", "off"):
+        return
+    if v.lower() in ("1", "true", "yes", "on", "all"):
+        set_debug(True)
+    else:
+        set_debug(True, [t.strip() for t in v.split(",") if t.strip()])
+
+
+_debug_from_env()
 
 
 IST = timezone(timedelta(hours=5, minutes=30))   # India Standard Time (no DST)
@@ -88,6 +203,9 @@ def _run(cmd, **kw):
 def parse_rtp(buf):
     """Parse an RTP packet (bytes). Returns dict(pt, seq, ts, ssrc, payload) or None."""
     if len(buf) < 12 or (buf[0] >> 6) != 2:   # require RTP version 2
+        if DEBUG:                             # guard: this runs once per packet
+            trace("rtp", f"REJECTED {len(buf)}B buffer, version="
+                         f"{(buf[0] >> 6) if buf else '?'} (need >=12B and v2)", limit=3)
         return None
     cc = buf[0] & 0x0F
     padding = (buf[0] >> 5) & 1
@@ -102,13 +220,18 @@ def parse_rtp(buf):
         pad = payload[-1]
         if 0 < pad <= len(payload):
             payload = payload[:-pad]
-    return {
+    r = {
         "pt": buf[1] & 0x7F,
         "seq": (buf[2] << 8) | buf[3],
         "ts": int.from_bytes(buf[4:8], "big"),
         "ssrc": int.from_bytes(buf[8:12], "big"),
         "payload": payload,
     }
+    if DEBUG:                                 # guard: this runs once per packet
+        trace("rtp", f"pt={r['pt']} seq={r['seq']} ts={r['ts']} ssrc=0x{r['ssrc']:08X} | "
+                     f"header={off}B (cc={cc} ext={ext} pad={padding}) "
+                     f"payload={len(payload)}B starts {payload[:6].hex()}", limit=3)
+    return r
 
 
 # --------------------------------------------------------------------------- #
@@ -117,11 +240,15 @@ def parse_rtp(buf):
 def detect_streams(pcap):
     """Return one dict per RTP stream with topology, packet count, modal payload size,
     modal timestamp delta, duration, and a codec guess. Robust to multi-word payload names."""
+    trace_reset()
+    trace("detect", f"STEP 1 - running tshark on {os.path.basename(pcap)} "
+                    f"with heuristic RTP enabled")
     out = _run(
         [TSHARK, "-r", pcap, "-o", "rtp.heuristic_rtp:TRUE", "-Y", "rtp", "-T", "fields",
          "-e", "ip.src", "-e", "udp.srcport", "-e", "ip.dst", "-e", "udp.dstport",
          "-e", "udp.payload", "-e", "frame.time_relative", "-e", "frame.time_epoch"],
     ).stdout
+    trace("detect", f"STEP 2 - tshark returned {len(out.splitlines())} RTP packet lines")
     agg = {}
     for line in out.splitlines():
         f = line.split("\t")
@@ -131,6 +258,9 @@ def detect_streams(pcap):
         # make tshark emit one value per protocol layer, comma-joined outer->inner.
         # The media always rides the INNERMOST IP/UDP, so take the last value. An
         # untunneled packet has a single value, so [-1] == [0] and nothing changes.
+        if DEBUG and any("," in c for c in f):   # guard: this runs once per packet
+            trace("tunnel", f"multi-layer packet, keeping innermost: "
+                            f"ip.src={f[0]} sport={f[1]} ip.dst={f[2]} dport={f[3]}", limit=3)
         f = [c.split(",")[-1] for c in f]
         up = f[4].replace(":", "")
         if len(up) < 24:                          # need at least a 12-byte RTP header
@@ -145,6 +275,9 @@ def detect_streams(pcap):
         except ValueError:
             continue
         size = len(up) // 2 - 12                  # approx payload size (ignores CSRC/extension)
+        if DEBUG:                                # guard: this runs once per packet
+            trace("packet", f"{sip}:{sport} -> {dip}:{dport} ssrc=0x{ssrc:08X} "
+                            f"pt={pt} ts={ts} payload={size}B t={t:.3f}s", limit=5)
         key = (sip, sport, dip, dport, ssrc)
         d = agg.get(key)
         if d is None:
@@ -183,11 +316,17 @@ def detect_streams(pcap):
             "start_time": _fmt_ist(d["epoch0"]), "end_time": _fmt_ist(d["epoch1"]),
         }
         s["codec"], s["wideband"], s["mode"] = classify(s)
+        trace("classify", f'{sip}:{sport}->{dip}:{dport} pkts={s["pkts"]} pt={s["pt"]} '
+                          f'ts_delta={s["ts_delta"]} mode_size={s["mode_size"]} '
+                          f'max_size={s["max_size"]} same_ts={s["same_ts"]}'
+                          f'  ==>  {s["codec"]}')
         if s["codec"] == "video":                 # refine to H264/H265 from the actual NAL header
             r = parse_rtp(bytes.fromhex(d["sample"])) if d["sample"] else None
             s["codec"] = fingerprint_video(r["payload"].hex() if r else None)
         streams.append(s)
     streams.sort(key=lambda x: -x["pkts"])
+    trace("detect", f"STEP 3 - grouped into {len(streams)} distinct stream(s) "
+                    f"(keyed by src ip:port + dst ip:port + SSRC)")
     return streams
 
 
@@ -286,6 +425,10 @@ def depacketize_be(payload, wideband=False):
         frames.append((ft << 3) | (q << 2))
         if nbits:
             frames += br.read_bytes_msb(nbits)
+    if DEBUG:                                     # guard: this runs once per packet
+        trace("amr", f"be: {len(payload)}B RTP -> {len(tocs)} frame(s) "
+                     f"FT={[ft for ft, _ in tocs]} -> {len(frames)}B storage "
+                     f"(FT 8=SID/comfort-noise, 0-7=speech)", limit=3)
     return bytes(frames)
 
 
@@ -307,6 +450,9 @@ def depacketize_oa(payload, wideband=False):
         nbytes = (nbits + 7) // 8
         frames.append((ft << 3) | (q << 2))
         frames += payload[i:i + nbytes]; i += nbytes
+    if DEBUG:                                     # guard: this runs once per packet
+        trace("amr", f"oa: {len(payload)}B RTP -> {len(tocs)} frame(s) "
+                     f"FT={[ft for ft, _ in tocs]} -> {len(frames)}B storage", limit=3)
     return bytes(frames)
 
 
@@ -321,6 +467,7 @@ def get_rtp_payloads_ts(pcap, s):
     flt = (f'ip.src=={s["src_ip"]} && udp.srcport=={s["src_port"]} && '
            f'ip.dst=={s["dst_ip"]} && udp.dstport=={s["dst_port"]} && '
            f'rtp.ssrc=={s["ssrc"]} && rtp')
+    trace("payloads", f"STEP 4 - tshark display filter: {flt}")
     out = _run(
         [TSHARK, "-r", pcap, "-o", "rtp.heuristic_rtp:TRUE", "-Y", flt,
          "-T", "fields", "-e", "udp.payload", "-e", "frame.time_relative"],
@@ -346,6 +493,9 @@ def get_rtp_payloads_ts(pcap, s):
         except ValueError:
             arr = 0.0
         rows.append((r["seq"], r["ts"], arr, r["payload"]))
+    trace("payloads", f"STEP 5 - kept {len(rows)} unique packets from "
+                      f"{len(out.splitlines())} tshark lines "
+                      f"(duplicate seq+ts and non-RTP dropped), sorting by sequence number")
     rows.sort(key=lambda r: r[0])      # by sequence number
     return [(ts, arr, pl) for _, ts, arr, pl in rows]
 
@@ -381,10 +531,31 @@ def reconstruct_timed(samples, frame_counts, ts_list, arr_list, rate):
     ref = arr_list if have_wall else [t / rate for t in _unwrap_ts(ts_list)]  # seconds
     ref0 = ref[0]
     offsets = [0]
+    want_gaps, gaps = tracing("gap"), []
     for i in range(1, len(ref)):
         pos_i = int(round((ref[i] - ref0) * rate))
         offsets.append(max(offsets[i - 1] + frame_counts[i - 1], pos_i))  # never overlap a frame
+        if want_gaps:
+            end_prev = offsets[i - 1] + frame_counts[i - 1]
+            gap = offsets[i] - end_prev
+            if gap > 0:
+                gaps.append(gap)
+            if gap > rate * GAP_REPORT_S:         # only narrate the audible ones
+                trace("gap", f"SILENCE {gap / rate:.2f}s starting at "
+                             f"t={end_prev / rate:.2f}s (between frame {i - 1} and {i})",
+                      limit=20)
+    if gaps:
+        big = sum(1 for g in gaps if g > rate * GAP_REPORT_S)
+        trace("gap", f"{len(gaps)} gap(s) total = {sum(gaps) / rate:.2f}s of silence: "
+                     f"{big} over {GAP_REPORT_S}s (narrated above), "
+                     f"{len(gaps) - big} shorter; largest {max(gaps) / rate:.2f}s, "
+                     f"median {sorted(gaps)[len(gaps) // 2] * 1000 / rate:.0f}ms")
     total = offsets[-1] + frame_counts[-1]
+    trace("timeline", f"STEP 10 - anchored to "
+                      f"{'packet arrival time' if have_wall else 'RTP timestamp'}: "
+                      f"{len(ref)} frames, received audio {sum(frame_counts) / rate:.2f}s, "
+                      f"real timeline {total / rate:.2f}s => "
+                      f"{(total - sum(frame_counts)) / rate:.2f}s of silence inserted")
     buf = array.array("h", bytes(2 * total))     # zero-filled (silence)
     pos = 0
     for fc, off in zip(frame_counts, offsets):
@@ -417,11 +588,15 @@ def decode_amr(amr_path, out_wav, wideband):
     dec = "amrwbdec" if wideband else "amrnbdec"
     rate = 16000 if wideband else 8000
     if _gst_has(dec):
+        trace("decode", f"STEP 8 - GStreamer {dec} is available, decoding at {rate}Hz")
         pipe = (f"filesrc location={amr_path} ! amrparse ! {dec} ! "
                 f"audioconvert ! audioresample ! wavenc ! filesink location={out_wav}")
         r = subprocess.run(["gst-launch-1.0", "-e", *pipe.split()], capture_output=True)
         if r.returncode == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 44:
             return "gstreamer:" + dec
+        trace("decode", f"GStreamer {dec} failed (rc={r.returncode}), falling back")
+    trace("decode", f"STEP 8 - using ffmpeg's native AMR decoder at {rate}Hz "
+                    f"(may skip SID/comfort-noise frames)")
     _run([FFMPEG, "-y", "-v", "error", "-i", amr_path,
           "-ar", str(rate), "-ac", "1", out_wav])
     return "ffmpeg:native"
@@ -510,12 +685,16 @@ def extract_video(pcap, s, out_path, codec):
         raise MediaxError("no RTP payloads matched the stream")
     payloads = [r[2] for r in rows]
     fps = _video_fps([r[0] for r in rows])
+    trace("extract", f"STEP 6 - {len(payloads)} video RTP packets, "
+                     f"{fps} fps from the 90kHz RTP timestamps")
     if codec == "H264":
         es, demux, suffix = depacketize_h264(payloads), "h264", ".h264"
     elif codec == "H265":
         es, demux, suffix = depacketize_h265(payloads), "hevc", ".h265"
     else:
         raise MediaxError(f"video codec '{codec}' is detect-only (extraction not implemented)")
+    trace("extract", f"STEP 7 - depacketized to {len(es)}B Annex-B elementary stream, "
+                     f"remuxing to MP4 with ffmpeg -c copy (no re-encode)")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
         tf.write(es)
         raw_path = tf.name
@@ -533,10 +712,14 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
     """Extract one stream. Audio -> WAV (RTP-timestamp accurate by default); video -> MP4.
     Auto-classifies if codec is None. Returns (frames, decoder, info-dict).
     """
+    trace_reset()
     if codec is None:
         codec = s.get("codec") or classify(s)[0]
     mode = mode or s.get("mode") or "be"
     wideband = codec == "AMR-WB"
+    trace("extract", f"STEP 3 - {s['src_ip']}:{s['src_port']}->{s['dst_ip']}:{s['dst_port']} "
+                     f"{s['ssrc']} codec={codec} mode={mode} wideband={wideband} "
+                     f"timing={timing} -> {out_path}")
 
     if codec in VIDEO_CODECS:
         return extract_video(pcap, s, out_path, codec)
@@ -551,6 +734,9 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
     arr_list = [r[1] for r in rows]
     payloads = [r[2] for r in rows]
     rate = 16000 if wideband else 8000
+    trace("extract", f"STEP 6 - {len(payloads)} payloads at {rate}Hz, capture spans "
+                     f"{arr_list[0]:.2f}s -> {arr_list[-1]:.2f}s "
+                     f"({arr_list[-1] - arr_list[0]:.2f}s of wall-clock)")
 
     # 1) decode received frames to a concatenated PCM stream + per-frame sample counts
     tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
@@ -569,6 +755,9 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
         body = bytearray(b"#!AMR-WB\n" if wideband else b"#!AMR\n")
         for p in payloads:
             body += depay(p, wideband)
+        trace("extract", f"STEP 7 - built {len(body)}B .amr file "
+                         f"({'#!AMR-WB' if wideband else '#!AMR'} magic + "
+                         f"{len(payloads)} depacketized frames)")
         with tempfile.NamedTemporaryFile(suffix=".amr", delete=False) as tf:
             tf.write(body)
             amr_path = tf.name
@@ -578,6 +767,9 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
         frame_counts = [fs] * len(payloads)
 
     sr, samples = load_samples(tmp_wav)
+    trace("extract", f"STEP 9 - decoder produced {len(samples)} PCM samples @{sr}Hz "
+                     f"= {len(samples) / sr:.2f}s of back-to-back audio "
+                     f"(expected {sum(frame_counts)})")
     os.unlink(tmp_wav)
 
     # 2) place on the real timeline (or concatenate)
@@ -592,6 +784,8 @@ def extract_stream(pcap, s, out_path, codec=None, mode=None, timing="accurate"):
         buf = samples
     write_wav(out_wav, buf, sr)
     info["duration_s"] = round(len(buf) / sr, 2)
+    trace("extract", f"STEP 11 - wrote {out_wav} ({len(buf)} samples, "
+                     f"{info['duration_s']}s) | {json.dumps(info)}")
     return len(payloads), decoder, info
 
 
@@ -694,11 +888,21 @@ def main():
     ap = argparse.ArgumentParser(description="PCAP RTP media extractor (audio + video)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    d = sub.add_parser("detect", help="list RTP streams with codec guess")
+    # --debug / --debug-tags are shared by every sub-command (see the tracing block above)
+    dbg = argparse.ArgumentParser(add_help=False)
+    dbg.add_argument("--debug", action="store_true",
+                     help="print a step-by-step trace of what the pipeline is doing")
+    dbg.add_argument("--debug-tags", metavar="TAGS",
+                     help="limit --debug to these comma-separated tags: detect, tunnel, "
+                          "packet, rtp, classify, payloads, amr, decode, extract, "
+                          "timeline, gap")
+
+    d = sub.add_parser("detect", parents=[dbg], help="list RTP streams with codec guess")
     d.add_argument("pcap")
     d.add_argument("--json", action="store_true")
 
-    e = sub.add_parser("extract", help="extract one stream (audio->WAV, video->MP4)")
+    e = sub.add_parser("extract", parents=[dbg],
+                       help="extract one stream (audio->WAV, video->MP4)")
     e.add_argument("pcap")
     e.add_argument("--src"); e.add_argument("--sport", type=int, required=True)
     e.add_argument("--dst"); e.add_argument("--dport", type=int, required=True)
@@ -709,16 +913,20 @@ def main():
     e.add_argument("-o", "--out", required=True)
     e.add_argument("--validate-against")
 
-    a = sub.add_parser("extract-all", help="extract every supported media stream to a folder")
+    a = sub.add_parser("extract-all", parents=[dbg],
+                       help="extract every supported media stream to a folder")
     a.add_argument("pcap")
     a.add_argument("-o", "--out-dir", required=True)
     a.add_argument("--timing", choices=["accurate", "compact"], default="accurate")
 
-    v = sub.add_parser("validate", help="compare a WAV against a reference")
+    v = sub.add_parser("validate", parents=[dbg], help="compare a WAV against a reference")
     v.add_argument("wav"); v.add_argument("reference")
     v.add_argument("--rate", type=int, default=8000)
 
     args = ap.parse_args()
+    if getattr(args, "debug", False):
+        tags = args.debug_tags.split(",") if args.debug_tags else None
+        set_debug(True, tags)
 
     if args.cmd == "detect":
         streams = detect_streams(args.pcap)

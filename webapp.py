@@ -12,7 +12,9 @@ import hmac
 import json
 import os
 import re
+import time
 import uuid
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -25,10 +27,61 @@ OUTPUTS = os.path.join(WORK, "outputs")
 os.makedirs(UPLOADS, exist_ok=True)
 os.makedirs(OUTPUTS, exist_ok=True)
 
+# ---- debug logs (only ever created when the server is started with --debug) -- #
+# Lives under _work/, which .gitignore already excludes, so logs can never be
+# committed. The folder is created lazily -- a normal run leaves no trace of it.
+LOGS = os.path.join(WORK, "logs")
+LOG_PREFIX, LOG_SUFFIX = "webapp-", ".log"   # prune only touches files we created
+LOG_RETENTION_DAYS = 7                       # delete logs older than this
+LOG_KEEP_MAX = 50                            # ...and keep at most this many, newest first
+
 UPLOAD_REGISTRY = {}   # token -> {"path":..., "name":...}
 OUTPUT_REGISTRY = {}   # token -> path
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 MAX_UPLOAD = 500 * 1024 * 1024  # 500 MB cap
+
+
+def prune_logs():
+    """Delete stale debug logs: first anything older than LOG_RETENTION_DAYS, then the
+    oldest files beyond LOG_KEEP_MAX. Only files this app created (webapp-*.log in
+    _work/logs/) are ever considered -- nothing else in the folder is touched."""
+    if not os.path.isdir(LOGS):
+        return 0
+    cutoff = time.time() - LOG_RETENTION_DAYS * 86400
+    removed, keep = 0, []
+    for name in os.listdir(LOGS):
+        if not (name.startswith(LOG_PREFIX) and name.endswith(LOG_SUFFIX)):
+            continue
+        path = os.path.join(LOGS, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime < cutoff:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+        else:
+            keep.append((mtime, path))
+    keep.sort()                                     # oldest first
+    for _, path in keep[:max(0, len(keep) - LOG_KEEP_MAX)]:
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def open_log():
+    """Create _work/logs/ and open this run's log file. Called only for --debug."""
+    os.makedirs(LOGS, exist_ok=True)
+    name = f"{LOG_PREFIX}{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}{LOG_SUFFIX}"
+    path = os.path.join(LOGS, name)
+    return path, open(path, "a", encoding="utf-8", buffering=1)
+
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -286,8 +339,11 @@ observeReveals();   // reveal the hero on first paint
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # quieter logs
-        pass
+    def log_message(self, fmt, *a):
+        """Silent by default; every request is logged once tracing is on
+        (mediax --debug / MEDIAX_DEBUG=1 / mediax.set_debug(True))."""
+        if mediax.tracing("web"):   # guard: skip the % formatting on every request
+            mediax.trace("web", f"{self.address_string()} {fmt % a}")
 
     def _send(self, code, body, ctype="application/json", extra=None):
         if isinstance(body, (dict, list)):
@@ -358,6 +414,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/extract":
                 return self._extract()
         except Exception as e:  # surface engine errors as JSON
+            mediax.trace("web", f"ERROR on {u.path}: {type(e).__name__}: {e}")
             return self._send(400, {"error": str(e)})
         return self._send(404, {"error": "not found"})
 
@@ -378,6 +435,10 @@ class Handler(BaseHTTPRequestHandler):
                 fh.write(chunk)
                 remaining -= len(chunk)
         UPLOAD_REGISTRY[token] = {"path": path, "name": name}
+        if mediax.DEBUG:
+            prune_logs()      # opportunistic cleanup so a long-lived server stays tidy
+            mediax.trace("web", f"uploaded {name} ({length} bytes) -> {path}, "
+                                f"detecting streams...")
         streams = mediax.detect_streams(path)
         return self._send(200, {"file_id": token, "streams": streams})
 
@@ -399,6 +460,9 @@ class Handler(BaseHTTPRequestHandler):
                 f'_{s["ssrc"]}{tag}{ext}')
         name = SAFE_NAME.sub("_", name)
         out_path = os.path.join(OUTPUTS, name)
+        mediax.trace("web", f'extract request: {s["src_ip"]}:{s["src_port"]}->'
+                            f'{s["dst_ip"]}:{s["dst_port"]} {s["ssrc"]} '
+                            f'codec={codec} timing={timing}')
         _, _, info = mediax.extract_stream(up["path"], s, out_path,
                                            codec=s["codec"], mode=s.get("mode"), timing=timing)
         tok = uuid.uuid4().hex
@@ -415,6 +479,29 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int,
                     default=int(os.environ.get("MEDIAX_PORT") or os.environ.get("PORT") or PORT),
                     help="listen port (honours $PORT, set by Render/Railway/Cloud Run/Fly)")
+    ap.add_argument("--debug", action="store_true",
+                    help="log every request and trace the extraction pipeline "
+                         "(same tracing as mediax.py --debug)")
+    ap.add_argument("--debug-tags", metavar="TAGS",
+                    help="limit --debug to these comma-separated mediax trace tags")
     args = ap.parse_args()
+    log_fh = None
+    if args.debug:
+        mediax.set_debug(True, args.debug_tags.split(",") if args.debug_tags else None)
+        dropped = prune_logs()                      # clear stale logs before opening a new one
+        log_path, log_fh = open_log()
+        mediax.set_trace_sink(log_fh)
+        print(f"debug tracing -> {log_path}")
+        print(f"  (logs kept {LOG_RETENTION_DAYS} days / {LOG_KEEP_MAX} files"
+              f"{f'; pruned {dropped} stale' if dropped else ''})")
+        mediax.trace("web", f"server starting on {args.host}:{args.port} "
+                            f"(pid {os.getpid()})")
     print(f"PCAP RTP Media Extractor  ->  http://{args.host}:{args.port}")
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    except KeyboardInterrupt:
+        mediax.trace("web", "server stopped")
+    finally:
+        if log_fh:
+            mediax.set_trace_sink(None)
+            log_fh.close()

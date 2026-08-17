@@ -26,6 +26,7 @@ hear silence at exactly that point.
 - [Supported codecs](#supported-codecs)
 - [Validating against known-good files](#validating-against-known-good-files)
 - [How it works](#how-it-works)
+- [Debug tracing](#debug-tracing)
 - [Troubleshooting](#troubleshooting)
 - [Limitations & roadmap](#limitations--roadmap)
 - [Project files](#project-files)
@@ -300,6 +301,114 @@ silently.
 
 ---
 
+## Debug tracing
+
+Every stage of the pipeline can narrate itself. Tracing is **off by default and costs nothing**
+when off — output is byte-identical either way.
+
+**Turn it on** (any one of these):
+
+```bash
+python3 mediax.py detect capture.pcap --debug     # per-run flag
+MEDIAX_DEBUG=1 python3 mediax.py detect capture.pcap   # env var
+python3 webapp.py --debug                          # web app (also logs every request)
+```
+
+Or flip `DEBUG = True` at the top of `mediax.py` to trace permanently, or call
+`mediax.set_debug(True)` from your own Python.
+
+**A traced extraction reads as a numbered story.** Every line is prefixed with the
+`file.py:line` that produced it, so you can jump straight to the code behind any step:
+
+```
+mediax.py:244    [detect]   STEP 1 - running tshark on capture.pcap with heuristic RTP enabled
+mediax.py:251    [detect]   STEP 2 - tshark returned 2200 RTP packet lines
+mediax.py:279    [packet]   10.63.5.25:16152 -> 10.44.139.5:15288 ssrc=0x133FA82D pt=118 payload=32B
+mediax.py:319    [classify] ... pkts=2200 pt=118 ts_delta=160 mode_size=32  ==>  AMR-NB
+mediax.py:328    [detect]   STEP 3 - grouped into 1 distinct stream(s)
+mediax.py:470    [payloads] STEP 4 - tshark display filter: ip.src==... && rtp.ssrc==... && rtp
+mediax.py:231    [rtp]      pt=118 seq=12834 ts=... | header=12B (cc=0 ext=0 pad=0) payload=32B
+mediax.py:496    [payloads] STEP 5 - kept 2200 unique packets from 2200 tshark lines
+mediax.py:737    [extract]  STEP 6 - 2200 payloads at 8000Hz, capture spans 0.00s -> 41.83s
+mediax.py:429    [amr]      be: 32B RTP -> 1 frame(s) FT=[7] -> 32B storage
+mediax.py:758    [extract]  STEP 7 - built 70406B .amr file (#!AMR magic + 2200 frames)
+mediax.py:591    [decode]   STEP 8 - GStreamer amrnbdec is available, decoding at 8000Hz
+mediax.py:770    [extract]  STEP 9 - decoder produced 352000 PCM samples @8000Hz = 44.00s
+mediax.py:554    [timeline] STEP 10 - anchored to packet arrival time: ... 0.00s silence inserted
+mediax.py:787    [extract]  STEP 11 - wrote out.wav (352000 samples, 44.0s)
+```
+
+Line numbers are resolved at run time from the live call stack, so they stay correct as the
+code moves around — they are never hard-coded.
+
+**Filter to just what you care about** with comma-separated tags:
+
+```bash
+MEDIAX_DEBUG=gap,timeline python3 mediax.py extract capture.pcap --sport 1246 --dport 17484 -o out.wav
+```
+```
+mediax.py:551    [gap]      SILENCE 0.37s starting at t=26.42s (between frame 885 and 886)
+mediax.py:557    [gap]      251 gap(s) total = 18.43s of silence: 3 over 0.2s, 248 shorter;
+                            largest 0.37s, median 40ms
+mediax.py:554    [timeline] STEP 10 - anchored to packet arrival time: 1688 frames, received
+                            audio 33.76s, real timeline 52.19s => 18.43s of silence inserted
+```
+
+| Tag | Shows |
+|-----|-------|
+| `detect` | tshark invocation, packet count, stream count |
+| `tunnel` | GTP-U tunneled packets and which (innermost) layer was kept |
+| `packet` | each RTP packet as it is aggregated (first 5) |
+| `rtp` | `parse_rtp()` header decode, and packets it rejects (first 3) |
+| `classify` | the codec verdict per stream, **with the evidence behind it** |
+| `payloads` | the per-stream tshark filter and the deduplication result |
+| `amr` | RTP AMR depacketization — frame types per packet (first 3) |
+| `decode` | which decoder actually ran (GStreamer vs ffmpeg fallback) |
+| `extract` | the numbered milestones above |
+| `timeline` | real-timeline reconstruction summary |
+| `gap` | every silence over 0.2 s (tune `GAP_REPORT_S`) plus a distribution summary |
+| `web` | `webapp.py` HTTP requests, uploads, extract calls |
+
+Per-packet tags are capped (first 3–5 occurrences) so a large capture can't flood the terminal.
+The `classify` and `gap` tags are the two most useful: the first explains *why* a codec was
+chosen, the second shows exactly *where* audio stopped — which is the whole point of mute analysis.
+
+### Web app log files
+
+`python3 webapp.py --debug` additionally **tees the whole trace to a timestamped log file**, so
+you can review a detection long after the terminal has scrolled away:
+
+```
+_work/logs/webapp-20260817-120528-8258.log     # webapp-<date>-<time>-<pid>.log
+```
+```
+12:11:31.642 webapp.py:440    [web]      uploaded x.pcap (228824 bytes) -> ..., detecting...
+12:11:32.125 mediax.py:251    [detect]   STEP 2 - tshark returned 2200 RTP packet lines
+12:11:32.134 mediax.py:319    [classify] 10.63.5.25:16152->10.44.139.5:15288 ... ==> AMR-NB
+```
+
+One file per server run: `timestamp | file:line | tag | message`. The millisecond timestamp is
+log-file-only (the console keeps the shorter form). HTTP requests and any extraction error are
+logged too, and the `file:line` column spans both files — you can see control passing from
+`webapp.py` into the `mediax.py` engine.
+
+**Without `--debug` no log file — and no `logs/` folder — is created at all.**
+
+**Automatic cleanup.** Old logs are pruned on startup and after each upload:
+
+| Rule | Default | Constant in `webapp.py` |
+|------|---------|------------------------|
+| Delete logs older than | 7 days | `LOG_RETENTION_DAYS` |
+| Then keep at most | 50 files | `LOG_KEEP_MAX` |
+
+Pruning only ever considers files matching `webapp-*.log` inside `_work/logs/`; anything else you
+put in that folder is left alone.
+
+**Never committed.** `_work/` is already in `.gitignore`, and `logs/` + `*.log` are listed
+explicitly as a second line of defence.
+
+---
+
 ## Troubleshooting
 
 **`detect` finds no streams.**
@@ -345,5 +454,6 @@ mediax.py     # the engine + CLI (detect / extract / extract-all / validate)
 webapp.py     # zero-dependency web UI (imports mediax)
 wiresharks/   # sample input captures (for testing)
 AP_MUTE_ISSUE/# reference decoded outputs (.avi) + their source pcaps (for validation)
-_work/        # created at runtime by the web app: uploads/ and outputs/
+_work/        # created at runtime by the web app: uploads/, outputs/
+              #   ...and logs/ (only when started with --debug; auto-pruned, git-ignored)
 ```
