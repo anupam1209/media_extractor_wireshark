@@ -47,6 +47,7 @@ AUDIO_CODECS = {"AMR-NB", "AMR-WB", "G711u", "G711a"}
 VIDEO_CODECS = {"H264", "H265"}          # depacketize + remux supported (VP8 = detect-only)
 SUPPORTED = AUDIO_CODECS | VIDEO_CODECS
 START_CODE = b"\x00\x00\x00\x01"         # Annex-B NAL unit separator
+FINGERPRINT_SAMPLES = 20                  # video: leading RTP packets to scan for the codec's NAL header
 
 
 # --------------------------------------------------------------------------- #
@@ -284,14 +285,14 @@ def detect_streams(pcap):
             d = agg[key] = {"pt": pt, "pkts": 0, "sizes": Counter(),
                             "deltas": Counter(), "last_ts": None, "t0": t, "t1": t,
                             "epoch0": epoch, "epoch1": epoch,
-                            "max_size": 0, "same_ts": 0, "sample": None}
+                            "max_size": 0, "same_ts": 0, "samples": []}
         d["pkts"] += 1
         if size > 0:
             d["sizes"][size] += 1
             if size > d["max_size"]:
                 d["max_size"] = size
-        if d["sample"] is None:
-            d["sample"] = up                      # first whole RTP packet (for video fingerprint)
+        if len(d["samples"]) < FINGERPRINT_SAMPLES:
+            d["samples"].append(up)               # first few whole RTP packets (for video fingerprint)
         if d["last_ts"] is not None:
             delta = ts - d["last_ts"]
             if delta == 0:
@@ -320,9 +321,8 @@ def detect_streams(pcap):
                           f'ts_delta={s["ts_delta"]} mode_size={s["mode_size"]} '
                           f'max_size={s["max_size"]} same_ts={s["same_ts"]}'
                           f'  ==>  {s["codec"]}')
-        if s["codec"] == "video":                 # refine to H264/H265 from the actual NAL header
-            r = parse_rtp(bytes.fromhex(d["sample"])) if d["sample"] else None
-            s["codec"] = fingerprint_video(r["payload"].hex() if r else None)
+        if s["codec"] == "video":                 # refine to H264/H265 from the actual NAL headers
+            s["codec"] = fingerprint_video(d["samples"])
         streams.append(s)
     streams.sort(key=lambda x: -x["pkts"])
     trace("detect", f"STEP 3 - grouped into {len(streams)} distinct stream(s) "
@@ -347,28 +347,39 @@ def classify(s):
     return f"PT{pt}", False, "be"  # unknown / unsupported
 
 
-def fingerprint_video(sample):
-    """Best-effort video codec from the first RTP payload's NAL header.
-    H.264 (RFC 6184): 1-byte NAL header, type = b0 & 0x1F.
-    H.265 (RFC 7798): 2-byte NAL header, type = (b0 >> 1) & 0x3F."""
-    if not sample:
-        return "video"
-    try:
-        b = bytes.fromhex(sample)
-    except ValueError:
-        return "video"
-    if not b or (b[0] & 0x80):  # forbidden_zero_bit must be 0 for a real NAL
-        return "video"
-    t264 = b[0] & 0x1F
-    t265 = (b[0] >> 1) & 0x3F
-    if t265 in (48, 49, 50):                 # H.265 AP / FU / PACI (distinctive)
-        return "H265"
-    if t264 in (24, 28, 29):                 # H.264 STAP-A / FU-A / FU-B (distinctive)
-        return "H264"
-    if t265 in (32, 33, 34, 19, 20, 21):     # H.265 VPS/SPS/PPS/IDR
-        return "H265"
-    if t264 in (1, 5, 6, 7, 8):              # H.264 slice/IDR/SEI/SPS/PPS
-        return "H264"
+def fingerprint_video(samples):
+    """Best-effort video codec from the leading RTP payloads' NAL headers.
+
+    Scans the first several packets, not just one: some senders emit a tiny standalone
+    Access Unit Delimiter (H.264 NAL type 9) or other non-VCL NAL ahead of each frame, so
+    the very first packet on the wire may not name the codec by itself. Returns the first
+    packet that gives a definitive verdict; falls back to the generic "video" only if none
+    of the sampled packets identify H.264/H.265.
+
+    `samples` is the list of whole-RTP-packet hex strings collected in detect_streams
+    (a lone hex string is also accepted). H.264 (RFC 6184): 1-byte NAL header,
+    type = b0 & 0x1F. H.265 (RFC 7798): 2-byte NAL header, type = (b0 >> 1) & 0x3F."""
+    if isinstance(samples, str):                  # tolerate a single whole-packet hex string
+        samples = [samples]
+    for up in samples or []:
+        try:
+            r = parse_rtp(bytes.fromhex(up)) if up else None
+        except ValueError:
+            continue
+        b = r["payload"] if r else b""
+        if not b or (b[0] & 0x80):                # forbidden_zero_bit must be 0 for a real NAL
+            continue
+        t264 = b[0] & 0x1F
+        t265 = (b[0] >> 1) & 0x3F
+        if t265 in (48, 49, 50):                  # H.265 AP / FU / PACI (distinctive)
+            return "H265"
+        if t264 in (24, 28, 29):                  # H.264 STAP-A / FU-A / FU-B (distinctive)
+            return "H264"
+        if t265 in (32, 33, 34, 19, 20, 21):      # H.265 VPS/SPS/PPS/IDR
+            return "H265"
+        if t264 in (1, 5, 6, 7, 8, 9):            # H.264 slice/IDR/SEI/SPS/PPS/AUD
+            return "H264"
+        # unrecognized NAL (e.g. a lone AUD ahead of an H.265 frame) -> try the next packet
     return "video"
 
 
