@@ -9,9 +9,15 @@ Flow:  upload PCAP  ->  auto-detected streams table  ->  Extract (per stream)  -
 """
 import base64
 import hmac
+import ipaddress
 import json
 import os
 import re
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -39,6 +45,62 @@ UPLOAD_REGISTRY = {}   # token -> {"path":..., "name":...}
 OUTPUT_REGISTRY = {}   # token -> path
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 MAX_UPLOAD = 500 * 1024 * 1024  # 500 MB cap
+
+# ---- live "Stream to phone" sessions (ffmpeg -> MPEG-TS over UDP -> VLC) ----- #
+# Each Start spawns an ffmpeg that pushes the already-extracted file to the phone's
+# IP:port as MPEG-TS/UDP (the container carries codec info, so VLC needs no SDP).
+# Only usable when this server and the phone share a LAN -- see _valid_target().
+STREAM_REGISTRY = {}   # session -> {"proc","ip","port","path","cmd","err_path","stopped"}
+STREAM_LOCK = threading.Lock()
+DEFAULT_STREAM_PORT = 1234
+UDP_PKT_SIZE = 1316    # 7 x 188-byte TS packets: stays under a 1500-byte MTU
+
+
+def lan_ip():
+    """Best-effort primary LAN IPv4 of this machine (for the setup hint shown to the
+    user). Opens a throwaway UDP socket toward a public address -- no packet is sent,
+    it just makes the OS pick the outbound interface -- and reads back its local IP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def valid_target(ip):
+    """Validate the phone's IP and return it normalised, or raise ValueError.
+
+    Restricted to private / loopback / link-local IPv4 on purpose: this feature only
+    works when the phone is on the same LAN as this PC, and the restriction also keeps
+    the server from being coaxed into firing UDP at arbitrary internet hosts."""
+    try:
+        a = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        raise ValueError(f"'{ip}' is not a valid IP address")
+    if a.version != 4:
+        raise ValueError("please enter an IPv4 address (e.g. 192.168.1.57)")
+    if not (a.is_private or a.is_loopback or a.is_link_local):
+        raise ValueError("target must be a private/LAN address on the same Wi-Fi "
+                         "(e.g. 192.168.x.x or 10.x.x.x)")
+    return str(a)
+
+
+def stream_cmd(path, ip, port):
+    """ffmpeg command that real-time streams `path` to ip:port as MPEG-TS/UDP.
+    Video (.mp4/.h264/.h265) is copied as-is (no re-encode); audio (.wav) is
+    encoded to AAC because raw PCM does not ride in MPEG-TS."""
+    url = f"udp://{ip}:{port}?pkt_size={UDP_PKT_SIZE}"
+    cmd = [mediax.FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin",
+           "-re", "-i", path]
+    if path.lower().endswith((".mp4", ".mkv", ".h264", ".264", ".h265", ".hevc")):
+        cmd += ["-c", "copy"]
+    else:                                    # wav / raw PCM audio -> AAC for TS
+        cmd += ["-c:a", "aac", "-b:a", "64k"]
+    cmd += ["-f", "mpegts", url]
+    return cmd
 
 
 def prune_logs():
@@ -193,6 +255,71 @@ PAGE = r"""<!doctype html>
     .btn:hover{transform:none;}
     .hero-bg{transform:none !important;}
   }
+
+  /* "Stream to phone" button in the Output cell */
+  .btn-stream{font-family:inherit;font-size:13px;font-weight:500;letter-spacing:-.01em;
+    color:var(--blue);background:transparent;border:1px solid var(--hair);border-radius:980px;
+    padding:6px 14px;margin-top:.55rem;cursor:pointer;display:inline-flex;align-items:center;gap:.35em;
+    transition:background .2s var(--ease),border-color .2s var(--ease);}
+  .btn-stream:hover{background:#f0f6ff;border-color:var(--blue);}
+
+  /* guided "Stream to phone" modal */
+  .modal-overlay{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
+    padding:20px;background:rgba(0,0,0,.32);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);}
+  .modal-overlay[hidden]{display:none;}
+  .modal{position:relative;width:min(520px,100%);max-height:90vh;overflow-y:auto;background:var(--surface);
+    border-radius:20px;border:1px solid rgba(0,0,0,.08);box-shadow:0 24px 70px rgba(0,0,0,.28);padding:30px 30px 26px;}
+  .modal-x{position:absolute;top:16px;right:18px;border:0;background:transparent;color:var(--ink2);
+    font-size:26px;line-height:1;cursor:pointer;padding:2px 6px;border-radius:8px;transition:color .2s,background .2s;}
+  .modal-x:hover{color:var(--ink);background:#f0f0f3;}
+  .modal-title{font-size:22px;font-weight:600;letter-spacing:-.02em;margin:0 40px 2px 0;}
+  .modal-file{font-size:12.5px;margin:0 0 18px;word-break:break-all;}
+  .step-badge{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--blue);
+    margin-bottom:12px;}
+  .note{background:#fff8ee;border:1px solid #f0d9b5;color:#6b4e16;border-radius:12px;
+    padding:11px 14px;font-size:12.5px;line-height:1.5;margin:0 0 16px;}
+  .note b{color:#5a3d0a;}
+  .checklist{list-style:none;padding:0;margin:0 0 14px;}
+  .checklist li{position:relative;padding:9px 0 9px 26px;font-size:14px;border-bottom:1px solid #f0f0f2;}
+  .checklist li:last-child{border-bottom:0;}
+  .checklist li::before{content:"";position:absolute;left:2px;top:14px;width:7px;height:7px;border-radius:50%;
+    background:var(--blue);}
+  .hint{font-size:12.5px;color:var(--ink2);margin-top:3px;}
+  .hint b, .hint code{color:var(--ink);}
+  .state-ok{color:var(--ok,#1d8a4e);font-weight:600;}
+  .state-bad{color:#c0392b;font-weight:600;}
+  .confirm{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--ink2);margin:6px 0 4px;cursor:pointer;}
+  .confirm input{width:16px;height:16px;}
+  .vlc-steps{margin:0 0 14px;padding-left:20px;font-size:14px;}
+  .vlc-steps li{margin:8px 0;}
+  .field-row{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 4px;}
+  .field-row label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--ink2);font-weight:500;}
+  .field-row input{font:inherit;font-size:15px;color:var(--ink);padding:9px 12px;border:1px solid var(--hair);
+    border-radius:10px;background:var(--surface);}
+  .field-row input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(0,113,227,.15);}
+  .field-row input#phoneIp{width:190px;}
+  .field-row input#phonePort{width:96px;}
+  code, .codeblock{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  .codeblock{display:block;background:#f5f5f7;border:1px solid var(--hair);border-radius:10px;padding:10px 12px;
+    font-size:13px;color:var(--ink);margin:6px 0;word-break:break-all;user-select:all;cursor:pointer;}
+  .codeblock:hover{border-color:var(--blue);}
+  .err{color:#c0392b;font-size:13px;min-height:1.2em;margin-top:6px;}
+  .stream-status{font-size:13.5px;margin:12px 0 4px;min-height:1.2em;}
+  .stream-status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle;}
+  .stream-status.live .dot{background:#1d8a4e;animation:pulse 1.4s var(--ease) infinite;}
+  .stream-status.done .dot{background:var(--ink2);}
+  .stream-status.err .dot{background:#c0392b;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+  .step-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px;flex-wrap:wrap;}
+  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--hair);}
+  .btn.ghost:hover{background:#f5f5f7;}
+  .btn.danger{background:#c0392b;}
+  .btn.danger:hover{background:#d0432f;}
+  .cmd-details{margin-top:14px;font-size:12px;color:var(--ink2);}
+  .cmd-details summary{cursor:pointer;}
+  .cmd-details code{display:block;margin-top:8px;background:#f5f5f7;border:1px solid var(--hair);border-radius:8px;
+    padding:8px 10px;font-size:11.5px;color:var(--ink);word-break:break-all;white-space:pre-wrap;}
+  @media (prefers-reduced-motion: reduce){ .stream-status.live .dot{animation:none;} }
 </style></head>
 <body>
   <nav class="nav">
@@ -232,6 +359,68 @@ PAGE = r"""<!doctype html>
       </div>
     </section>
   </main>
+
+  <!-- guided "Stream to phone" flow (opens after a stream is extracted) -->
+  <div class="modal-overlay" id="phoneModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="phoneTitle">
+      <button class="modal-x" id="phoneClose" aria-label="Close">&times;</button>
+      <h3 class="modal-title" id="phoneTitle">Stream to phone</h3>
+      <p class="modal-file muted" id="phoneFile"></p>
+
+      <!-- Step 1: prerequisites -->
+      <div class="step" data-step="1">
+        <div class="step-badge">Step 1 of 3 &middot; Check your setup</div>
+        <div class="note">&#9888;&#65039; This pushes the video straight to your phone over the local network, so it only
+          works when this extractor is running on a <b>PC on the same Wi-Fi as the phone</b>. It will <b>not</b> work
+          from a remote / cloud-hosted instance.</div>
+        <ul class="checklist">
+          <li>This PC and your phone are on the <b>same Wi-Fi network</b>.
+            <div class="hint" id="pcIpHint">Your PC's IP: <b>&hellip;</b></div></li>
+          <li>The Wi-Fi allows device-to-device traffic
+            <span class="hint">(some &ldquo;guest&rdquo; networks block it &mdash; AP/client isolation).</span></li>
+          <li><b>VLC</b> is installed on the phone (App Store / Play Store).</li>
+          <li>Streaming tool on this PC (ffmpeg): <span id="ffmpegState">checking&hellip;</span></li>
+        </ul>
+        <label class="confirm"><input type="checkbox" id="prereqOk"> I've confirmed the above</label>
+        <div class="step-actions"><button class="btn" id="toStep2" disabled>Next</button></div>
+      </div>
+
+      <!-- Step 2: phone IP -->
+      <div class="step" data-step="2" hidden>
+        <div class="step-badge">Step 2 of 3 &middot; Your phone's IP address</div>
+        <p style="font-size:14px;margin:0 0 4px;">On the phone open
+          <b>Settings &rarr; Wi-Fi &rarr; (your network) &rarr; IP address</b> and type it below.</p>
+        <div class="field-row">
+          <label>Phone IP<input type="text" id="phoneIp" placeholder="192.168.1.57" inputmode="decimal" autocomplete="off"></label>
+          <label>Port<input type="number" id="phonePort" value="1234" min="1" max="65535"></label>
+        </div>
+        <div class="hint" id="subnetHint"></div>
+        <div class="err" id="ipErr"></div>
+        <div class="step-actions">
+          <button class="btn ghost" data-back="1">Back</button>
+          <button class="btn" id="toStep3">Next</button>
+        </div>
+      </div>
+
+      <!-- Step 3: start streaming -->
+      <div class="step" data-step="3" hidden>
+        <div class="step-badge">Step 3 of 3 &middot; Start the stream</div>
+        <ol class="vlc-steps">
+          <li>Open <b>VLC</b> on the phone &rarr; <b>New Stream</b> (Network Stream).</li>
+          <li>Enter this address and press play &mdash; VLC will wait for the video:
+            <code class="codeblock" id="vlcUrl" title="tap to select">udp://@:1234</code></li>
+          <li>Then press <b>Start streaming</b> below.</li>
+        </ol>
+        <div class="stream-status" id="streamStatus"></div>
+        <div class="step-actions">
+          <button class="btn ghost" data-back="2">Back</button>
+          <button class="btn" id="startStream">Start streaming</button>
+          <button class="btn danger" id="stopStream" hidden>Stop</button>
+        </div>
+        <details class="cmd-details"><summary>Show the command running on this PC</summary><code id="cmdText"></code></details>
+      </div>
+    </div>
+  </div>
 
 <script>
 let FILE_ID = null;
@@ -326,10 +515,144 @@ async function extract(s, btn, out) {
         + `<span class="muted">(${d.duration_s}s${d.gaps_filled_s?(', '+d.gaps_filled_s+'s silence'):''})</span>`
         + `<audio controls preload="none" src="${d.download}"></audio>`;
     }
+    // "Stream to phone" — reuses the download token (…?f=<tok>) to push the file over UDP to VLC
+    const tok = new URLSearchParams((d.download.split('?')[1] || '')).get('f');
+    if (tok) {
+      const label = `${s.src_ip}:${s.src_port} → ${s.dst_ip}:${s.dst_port} · ${s.codec}`;
+      const sb = document.createElement('button');
+      sb.className = 'btn-stream';
+      sb.innerHTML = '&#128241; Stream to phone';   // 📱
+      sb.onclick = () => openPhoneModal(tok, label);
+      out.appendChild(sb);
+    }
     // reveal the player even when the wide table is horizontally scrolled
     out.scrollIntoView({ behavior: REDUCE ? 'auto' : 'smooth', block: 'nearest', inline: 'end' });
   } catch (e) { out.innerHTML = '<span class="warn">'+e.message+'</span>'; }
   btn.disabled = false; btn.textContent = old;
+}
+
+/* ---------------- guided "Stream to phone" flow ---------------- */
+const phoneModal = $('#phoneModal');
+let STREAM_TOKEN = null;     // download token of the extracted file to stream
+let STREAM_SESSION = null;   // active server-side ffmpeg session id
+let STATUS_TIMER = null;
+let PC_IP = null;
+
+const subnetPrefix = ip => { const p = (ip||'').split('.'); return p.length === 4 ? p.slice(0,3).join('.') : ip; };
+const validIpClient = ip => {
+  const m = (ip||'').trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  return !!m && m.slice(1).every(o => +o >= 0 && +o <= 255);
+};
+function showStep(n){ phoneModal.querySelectorAll('.step').forEach(el => el.hidden = (el.dataset.step !== String(n))); }
+function setStatus(cls, html){
+  const el = $('#streamStatus');
+  el.className = 'stream-status' + (cls ? ' ' + cls : '');
+  el.innerHTML = (cls === 'live' || cls === 'done' || cls === 'err' ? '<span class="dot"></span>' : '') + html;
+}
+function stopPolling(){ if (STATUS_TIMER){ clearInterval(STATUS_TIMER); STATUS_TIMER = null; } }
+
+async function openPhoneModal(token, label){
+  STREAM_TOKEN = token;
+  $('#phoneFile').textContent = label || '';
+  $('#prereqOk').checked = false;
+  $('#toStep2').disabled = true;
+  $('#ipErr').textContent = '';
+  $('#startStream').hidden = false; $('#startStream').disabled = false; $('#startStream').textContent = 'Start streaming';
+  $('#stopStream').hidden = true;
+  setStatus('', '');
+  showStep(1);
+  phoneModal.hidden = false;
+  try {
+    const d = await (await fetch('/api/netinfo')).json();
+    PC_IP = d.lan_ip || null;
+    $('#pcIpHint').innerHTML = PC_IP
+      ? `Your PC's IP: <b>${PC_IP}</b> &mdash; the phone's IP should share the prefix <b>${subnetPrefix(PC_IP)}.x</b>`
+      : `Your PC's IP: <b>unknown</b>`;
+    const fs = $('#ffmpegState');
+    if (d.ffmpeg){ fs.textContent = 'found ✓'; fs.className = 'state-ok'; }
+    else { fs.textContent = 'not found ✗ — install ffmpeg on this PC'; fs.className = 'state-bad'; }
+  } catch(e){ $('#pcIpHint').innerHTML = `Your PC's IP: <b>unknown</b>`; }
+}
+
+async function stopStream(silent){
+  const session = STREAM_SESSION;
+  STREAM_SESSION = null;
+  stopPolling();
+  if (session){
+    try { await fetch('/api/stream/stop', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({session})}); } catch(e){}
+  }
+  if (!silent){
+    $('#stopStream').hidden = true;
+    $('#startStream').hidden = false; $('#startStream').disabled = false; $('#startStream').textContent = 'Stream again';
+    setStatus('done', 'Stopped.');
+  }
+}
+function closePhoneModal(){
+  phoneModal.hidden = true;
+  if (STREAM_SESSION) stopStream(true);   // never leave an orphaned ffmpeg running
+  else stopPolling();
+}
+
+$('#phoneClose').onclick = closePhoneModal;
+phoneModal.addEventListener('click', e => { if (e.target === phoneModal) closePhoneModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !phoneModal.hidden) closePhoneModal(); });
+
+$('#prereqOk').onchange = e => { $('#toStep2').disabled = !e.target.checked; };
+$('#toStep2').onclick = () => {
+  showStep(2);
+  const ipEl = $('#phoneIp');
+  if (PC_IP) ipEl.placeholder = subnetPrefix(PC_IP) + '.57';
+  $('#subnetHint').innerHTML = PC_IP ? `Tip: it should start with <b>${subnetPrefix(PC_IP)}.</b>` : '';
+  ipEl.focus();
+};
+phoneModal.querySelectorAll('[data-back]').forEach(b => b.onclick = () => showStep(+b.dataset.back));
+$('#toStep3').onclick = () => {
+  const ip = $('#phoneIp').value.trim(), port = +$('#phonePort').value;
+  if (!validIpClient(ip)){ $('#ipErr').textContent = 'Enter a valid IPv4 address, e.g. 192.168.1.57'; return; }
+  if (!(port >= 1 && port <= 65535)){ $('#ipErr').textContent = 'Port must be between 1 and 65535'; return; }
+  $('#ipErr').textContent = '';
+  $('#vlcUrl').textContent = `udp://@:${port}`;
+  showStep(3);
+};
+$('#vlcUrl').onclick = () => {
+  const r = document.createRange(); r.selectNodeContents($('#vlcUrl'));
+  const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+};
+
+$('#startStream').onclick = async () => {
+  const ip = $('#phoneIp').value.trim(), port = +$('#phonePort').value;
+  $('#startStream').disabled = true;
+  setStatus('', 'starting…');
+  try {
+    const r = await fetch('/api/stream/start', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({token: STREAM_TOKEN, ip, port})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'could not start');
+    STREAM_SESSION = d.session;
+    $('#cmdText').textContent = d.cmd || '';
+    $('#startStream').hidden = true;
+    $('#stopStream').hidden = false;
+    setStatus('live', `Streaming to <b>${ip}:${port}</b> in real time &mdash; watch VLC on your phone.`);
+    STATUS_TIMER = setInterval(pollStatus, 1500);
+  } catch(e){ setStatus('err', e.message); $('#startStream').disabled = false; }
+};
+$('#stopStream').onclick = () => stopStream(false);
+
+async function pollStatus(){
+  if (!STREAM_SESSION){ stopPolling(); return; }
+  try {
+    const d = await (await fetch('/api/stream/status?session=' + STREAM_SESSION)).json();
+    if (!d.running){
+      stopPolling(); STREAM_SESSION = null;
+      $('#stopStream').hidden = true;
+      $('#startStream').hidden = false; $('#startStream').disabled = false; $('#startStream').textContent = 'Stream again';
+      if (d.returncode === 0)
+        setStatus('done', 'Finished &mdash; the whole clip was sent. Press “Stream again” to replay.');
+      else
+        setStatus('err', 'ffmpeg stopped' + (d.error ? ': ' + d.error : ` (exit code ${d.returncode})`));
+    }
+  } catch(e){ /* transient network hiccup; keep polling */ }
 }
 
 observeReveals();   // reveal the hero on first paint
@@ -390,6 +713,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/":
             return self._send(200, PAGE, "text/html; charset=utf-8")
+        if u.path == "/api/netinfo":
+            return self._send(200, {"lan_ip": lan_ip(),
+                                    "ffmpeg": shutil.which(mediax.FFMPEG) is not None,
+                                    "default_port": DEFAULT_STREAM_PORT})
+        if u.path == "/api/stream/status":
+            return self._stream_status(parse_qs(u.query).get("session", [""])[0])
         if u.path == "/api/download":
             tok = parse_qs(u.query).get("f", [""])[0]
             path = OUTPUT_REGISTRY.get(tok)
@@ -413,6 +742,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._upload(u)
             if u.path == "/api/extract":
                 return self._extract()
+            if u.path == "/api/stream/start":
+                return self._stream_start()
+            if u.path == "/api/stream/stop":
+                return self._stream_stop()
         except Exception as e:  # surface engine errors as JSON
             mediax.trace("web", f"ERROR on {u.path}: {type(e).__name__}: {e}")
             return self._send(400, {"error": str(e)})
@@ -470,6 +803,95 @@ class Handler(BaseHTTPRequestHandler):
         info["download"] = f"/api/download?f={tok}"
         return self._send(200, info)
 
+    # ---- POST: live "Stream to phone" (ffmpeg -> MPEG-TS/UDP -> VLC) ------ #
+    def _stream_start(self):
+        length = int(self.headers.get("Content-Length", 0))
+        req = json.loads(self.rfile.read(length) or b"{}")
+        path = OUTPUT_REGISTRY.get(req.get("token"))
+        if not path or not os.path.exists(path):
+            return self._send(400, {"error": "file not found — extract this stream again"})
+        if not shutil.which(mediax.FFMPEG):
+            return self._send(400, {"error": "ffmpeg not found on this PC"})
+        try:
+            ip = valid_target(str(req.get("ip", "")))
+        except ValueError as e:
+            return self._send(400, {"error": str(e)})
+        try:
+            port = int(req.get("port", DEFAULT_STREAM_PORT))
+        except (ValueError, TypeError):
+            return self._send(400, {"error": "port must be a number"})
+        if not (1 <= port <= 65535):
+            return self._send(400, {"error": "port must be between 1 and 65535"})
+        cmd = stream_cmd(path, ip, port)
+        err_fh = tempfile.NamedTemporaryFile(prefix="mediax-stream-", suffix=".log", delete=False)
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=err_fh)
+        except OSError as e:
+            err_fh.close()
+            return self._send(400, {"error": f"could not start ffmpeg: {e}"})
+        finally:
+            err_fh.close()   # ffmpeg has its own dup'd handle; we reopen the path to read errors later
+        session = uuid.uuid4().hex
+        with STREAM_LOCK:
+            STREAM_REGISTRY[session] = {"proc": proc, "ip": ip, "port": port, "path": path,
+                                        "cmd": " ".join(cmd), "err_path": err_fh.name, "stopped": False}
+        mediax.trace("web", f"stream start {session[:8]} -> {ip}:{port} ({os.path.basename(path)})")
+        return self._send(200, {"session": session, "vlc_url": f"udp://@:{port}",
+                                "target": f"{ip}:{port}", "cmd": " ".join(cmd)})
+
+    def _stream_stop(self):
+        length = int(self.headers.get("Content-Length", 0))
+        req = json.loads(self.rfile.read(length) or b"{}")
+        info = self._end_stream(req.get("session", ""))
+        return self._send(200, {"stopped": bool(info)})
+
+    def _stream_status(self, session):
+        info = STREAM_REGISTRY.get(session)
+        if not info:
+            return self._send(404, {"error": "unknown session", "running": False})
+        rc = info["proc"].poll()
+        if rc is None:
+            return self._send(200, {"running": True, "returncode": None})
+        # process ended on its own -> report, capture any error, then retire the session
+        resp = {"running": False, "returncode": rc}
+        if rc != 0 and not info["stopped"]:
+            resp["error"] = self._stream_err_tail(info)
+        self._end_stream(session)
+        return self._send(200, resp)
+
+    @staticmethod
+    def _stream_err_tail(info, limit=300):
+        """Last chunk of ffmpeg's stderr, for surfacing why a stream died."""
+        try:
+            with open(info["err_path"], "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read().strip().replace("\n", " ")
+            return txt[-limit:] if txt else None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _end_stream(session):
+        """Terminate an ffmpeg session (if still running), drop it from the registry,
+        and delete its stderr log. Safe to call on an already-finished session."""
+        with STREAM_LOCK:
+            info = STREAM_REGISTRY.pop(session, None)
+        if not info:
+            return None
+        info["stopped"] = True
+        proc = info["proc"]
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        try:
+            os.remove(info["err_path"])
+        except OSError:
+            pass
+        return info
+
 
 if __name__ == "__main__":
     import argparse
@@ -502,6 +924,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         mediax.trace("web", "server stopped")
     finally:
+        for session in list(STREAM_REGISTRY):   # kill any live phone streams on shutdown
+            Handler._end_stream(session)
         if log_fh:
             mediax.set_trace_sink(None)
             log_fh.close()

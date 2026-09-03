@@ -118,7 +118,15 @@ Then open **http://127.0.0.1:8000** in a browser.
 1. **Choose a `.pcap`/`.pcapng` file** and click **Upload & detect**.
 2. The detected streams appear in a table, each with its auto-identified codec.
 3. Pick a timing mode (**Real timing** is the default — see [below](#timing-modes-real-vs-compact)).
-4. Click **Extract** on any supported row, then **download** the `.wav` or play it inline.
+4. Click **Extract** on any supported row, then **download** the `.wav`/`.mp4` or play it inline.
+5. **Optionally, stream a result to your phone** — click **📱 Stream to phone** on an extracted
+   row for a guided 3-step flow that pushes the stream to **VLC** on your phone (MPEG-TS over UDP).
+
+> **📱 "Stream to phone" only works when the app runs locally.** It sends the media straight to
+> your phone over the local network, so `webapp.py` must be running on a **PC on the same Wi-Fi as
+> the phone** — it will **not** work from a remote / cloud-hosted instance (Render, Oracle, etc.),
+> which isn't on your phone's network. The target must be a private/LAN IP, and the phone needs VLC
+> and [ffmpeg](https://ffmpeg.org/) installed on the serving PC.
 
 **Running it on a remote machine / VM** (so you can reach it from your laptop's browser):
 ```bash
