@@ -673,6 +673,51 @@ def depacketize_h265(payloads):
     return bytes(out)
 
 
+def leading_param_fixup(es, codec):
+    """Bytes to prepend to an Annex-B stream so ffmpeg can learn the picture size.
+
+    RTP video captures very often begin mid-stream: the encoder repeats its parameter
+    sets (H.264 SPS/PPS; H.265 VPS/SPS/PPS) only every few seconds, so the first ones
+    can sit ~10 s into the capture -- past the ~5 s ffmpeg probes before it must write
+    the MP4 header. When a coded slice appears before any parameter set, ffmpeg never
+    learns the dimensions and fails with "Could not write header (incorrect codec
+    parameters?)". We then copy the first parameter sets (found later in the stream) to
+    the very front so the remux is deterministic. Returns b'' when the stream already
+    leads with its parameter sets -- normal captures are left byte-for-byte unchanged.
+    (Duplicated parameter sets appearing again later are legal and ignored by decoders.)"""
+    if codec == "H264":
+        typ = lambda b: b & 0x1F
+        param_types, vcl = (7, 8), range(1, 6)            # SPS, PPS ; slice NALs 1..5
+    elif codec == "H265":
+        typ = lambda b: (b >> 1) & 0x3F
+        param_types, vcl = (32, 33, 34), range(0, 32)     # VPS/SPS/PPS ; VCL NALs 0..31
+    else:
+        return b""
+    found, slice_first = {}, False
+    for m in re.finditer(b"\x00\x00\x01", es):
+        i = m.end()
+        if i >= len(es):
+            break
+        t = typ(es[i])
+        if t in param_types:
+            if t not in found:
+                nxt = es.find(b"\x00\x00\x01", i)
+                # a NAL's last RBSP byte is never 0x00 (rbsp stop bit), so any trailing
+                # zeros belong to the following start code -- safe to strip.
+                found[t] = es[i:(nxt if nxt != -1 else len(es))].rstrip(b"\x00")
+                if len(found) == len(param_types):
+                    break
+        elif t in vcl and not found:
+            slice_first = True                            # a slice preceded every parameter set
+    if not (slice_first and found):
+        return b""
+    head = bytearray()
+    for t in param_types:
+        if t in found:
+            head += START_CODE + found[t]
+    return bytes(head)
+
+
 def _video_fps(ts_list):
     """Frame rate from the 90 kHz RTP timestamps (frame = a distinct timestamp)."""
     ts = _unwrap_ts(ts_list)
@@ -704,6 +749,12 @@ def extract_video(pcap, s, out_path, codec):
         es, demux, suffix = depacketize_h265(payloads), "hevc", ".h265"
     else:
         raise MediaxError(f"video codec '{codec}' is detect-only (extraction not implemented)")
+    head = leading_param_fixup(es, codec)
+    if head:
+        es = head + es
+        trace("extract", f"STEP 7a - capture began mid-stream (slices before the first "
+                         f"parameter set); prepended {len(head)}B of {codec} parameter sets "
+                         f"so ffmpeg can determine the picture size")
     trace("extract", f"STEP 7 - depacketized to {len(es)}B Annex-B elementary stream, "
                      f"remuxing to MP4 with ffmpeg -c copy (no re-encode)")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
