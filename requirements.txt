@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------------------
+# The CORE extractor (mediax.py + webapp.py) needs NO Python packages: it uses
+# only the standard library plus the external CLI tools tshark / ffmpeg (see the
+# README "Requirements" section). You do NOT need to install anything here to
+# detect, extract, download, or stream media.
+#
+# The packages below are ONLY for the OPTIONAL "Speech Quality (PESQ)" add-on
+# (pesq_quality.py + the "Speech Quality (PESQ)" tab in the web app). Install
+# them only if you want PESQ scoring:
+#
+#     pip install -r requirements.txt
+#
+# The `pesq` package builds a small C extension (via Cython), so a C compiler /
+# build toolchain may be required:
+#   * macOS   : xcode-select --install
+#   * Debian  : sudo apt install build-essential python3-dev
+# Prebuilt wheels are published for common CPython versions (3.8–3.12). On very
+# new interpreters (e.g. 3.13+) pip may fall back to building from source; using
+# Python 3.12 in a virtualenv is the smoothest path.
+# ---------------------------------------------------------------------------
+numpy>=1.22
+pesq>=0.0.4

@@ -25,13 +25,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import mediax
+import pesq_quality   # optional, isolated speech-quality (PESQ) add-on; see pesq_quality.py
 
-HOST, PORT = "127.0.0.1", 8000
+HOST, PORT = "127.0.0.1", 9000
 WORK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_work")
 UPLOADS = os.path.join(WORK, "uploads")
 OUTPUTS = os.path.join(WORK, "outputs")
+PESQ_DIR = os.path.join(WORK, "pesq")        # scratch for the isolated PESQ add-on
 os.makedirs(UPLOADS, exist_ok=True)
 os.makedirs(OUTPUTS, exist_ok=True)
+os.makedirs(PESQ_DIR, exist_ok=True)
 
 # ---- debug logs (only ever created when the server is started with --debug) -- #
 # Lives under _work/, which .gitignore already excludes, so logs can never be
@@ -43,6 +46,7 @@ LOG_KEEP_MAX = 50                            # ...and keep at most this many, ne
 
 UPLOAD_REGISTRY = {}   # token -> {"path":..., "name":...}
 OUTPUT_REGISTRY = {}   # token -> path
+PESQ_REGISTRY = {}     # token -> {"path":..., "name":...} for uploaded PESQ audio
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 MAX_UPLOAD = 500 * 1024 * 1024  # 500 MB cap
 
@@ -101,6 +105,31 @@ def stream_cmd(path, ip, port):
         cmd += ["-c:a", "aac", "-b:a", "64k"]
     cmd += ["-f", "mpegts", url]
     return cmd
+
+
+PESQ_MAX_AGE_S = 3600   # stale PESQ uploads (picked but never scored) are swept after an hour
+
+
+def prune_pesq():
+    """Delete abandoned PESQ uploads from _work/pesq/. A file is uploaded as soon as
+    the user picks it, but is only removed when a comparison actually runs -- if they
+    pick a file and then navigate away, it would linger. Only files this app wrote
+    (ref_*/deg_* under PESQ_DIR) and older than PESQ_MAX_AGE_S are ever touched."""
+    if not os.path.isdir(PESQ_DIR):
+        return 0
+    live = {os.path.basename(v["path"]) for v in PESQ_REGISTRY.values()}
+    cutoff, removed = time.time() - PESQ_MAX_AGE_S, 0
+    for name in os.listdir(PESQ_DIR):
+        if not name.startswith(("ref_", "deg_")) or name in live:
+            continue
+        path = os.path.join(PESQ_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def prune_logs():
@@ -320,16 +349,61 @@ PAGE = r"""<!doctype html>
   .cmd-details code{display:block;margin-top:8px;background:#f5f5f7;border:1px solid var(--hair);border-radius:8px;
     padding:8px 10px;font-size:11.5px;color:var(--ink);word-break:break-all;white-space:pre-wrap;}
   @media (prefers-reduced-motion: reduce){ .stream-status.live .dot{animation:none;} }
+
+  /* ======================================================================== */
+  /* Speech Quality (PESQ) — isolated add-on. All selectors below are scoped   */
+  /* to the PESQ view / nav tabs and touch nothing in the extractor view.      */
+  /* ======================================================================== */
+  .nav-tabs{display:flex;gap:4px;margin-left:auto;background:#f0f0f3;border-radius:980px;padding:4px;}
+  .nav-tab{font:inherit;font-size:13px;font-weight:500;color:var(--ink2);cursor:pointer;border:0;
+    background:transparent;padding:6px 14px;border-radius:980px;transition:all .3s var(--ease);}
+  .nav-tab:hover{color:var(--ink);}
+  .nav-tab.active{background:var(--surface);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08);}
+  @media (max-width:600px){ .nav-tabs{margin-left:0;} .nav-inner{flex-wrap:wrap;height:auto;padding:8px 22px;} }
+
+  .pesq-intro{max-width:760px;margin:0 auto 10px;text-align:center;}
+  .pesq-slots{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:26px 0 8px;}
+  @media (max-width:720px){ .pesq-slots{grid-template-columns:1fr;} }
+  .slot{background:var(--surface);border:1px solid rgba(0,0,0,.06);border-radius:18px;padding:20px 22px;}
+  .slot h3{font-size:15px;font-weight:600;letter-spacing:-.01em;margin:0 0 3px;}
+  .slot .slot-sub{font-size:12.5px;color:var(--ink2);margin:0 0 14px;}
+  .slot input[type=file]{width:100%;}
+
+  .pesq-controls{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:center;margin:22px 0 6px;}
+  .mode-toggle{display:flex;gap:4px;background:#f0f0f3;border-radius:980px;padding:4px;}
+  .mode-toggle label{font-size:13px;color:var(--ink2);cursor:pointer;padding:6px 14px;border-radius:980px;transition:all .3s var(--ease);}
+  .mode-toggle input{position:absolute;opacity:0;pointer-events:none;}
+  .mode-toggle label:has(input:checked){background:var(--surface);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08);}
+
+  .pesq-dep-warn{max-width:760px;margin:0 auto 14px;}
+  .score-badge{display:inline-flex;align-items:center;gap:7px;font-weight:600;font-variant-numeric:tabular-nums;}
+  .score-dot{width:9px;height:9px;border-radius:50%;flex:none;}
+  .q-excellent{color:#1d8a4e;} .q-excellent .score-dot{background:#1d8a4e;}
+  .q-good{color:#3a8a1d;}      .q-good .score-dot{background:#5fb62b;}
+  .q-fair{color:#9a7400;}      .q-fair .score-dot{background:#d9a400;}
+  .q-poor{color:#bf4800;}      .q-poor .score-dot{background:#e06c00;}
+  .q-bad{color:#c0392b;}       .q-bad .score-dot{background:#c0392b;}
+  .q-na{color:var(--ink2);}    .q-na .score-dot{background:var(--hair);}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;margin:14px 0 2px;font-size:12px;color:var(--ink2);}
+  .legend span{display:inline-flex;align-items:center;gap:6px;}
+  .legend i{width:9px;height:9px;border-radius:50%;display:inline-block;}
+  td.warn-cell{white-space:normal;max-width:360px;font-size:12.5px;color:var(--warn,#bf4800);}
+  td.warn-cell .ferr{color:#c0392b;}
 </style></head>
 <body>
   <nav class="nav">
     <div class="nav-inner">
       <span class="brand">PCAP RTP Media Extractor</span>
       <span class="nav-tag">RTP &middot; PCAP</span>
+      <div class="nav-tabs" role="tablist">
+        <button class="nav-tab active" data-view="extract" role="tab">Extractor</button>
+        <button class="nav-tab" data-view="pesq" role="tab">Speech Quality (PESQ)</button>
+      </div>
     </div>
   </nav>
 
   <main>
+    <div id="view-extract">
     <section class="hero">
       <div class="hero-bg" id="heroBg"></div>
       <h1 class="reveal">PCAP RTP Media Extractor</h1>
@@ -357,6 +431,73 @@ PAGE = r"""<!doctype html>
         </tr></thead><tbody></tbody></table>
         </div>
       </div>
+    </section>
+    </div><!-- /#view-extract -->
+
+    <!-- ===================== Speech Quality (PESQ) view ===================== -->
+    <!-- Isolated add-on: this whole <section> plus the pesq-* JS/CSS/routes can  -->
+    <!-- be removed without affecting the extractor above.                        -->
+    <section id="view-pesq" hidden>
+      <section class="hero">
+        <div class="hero-bg"></div>
+        <h1 class="reveal">Speech Quality (PESQ)</h1>
+        <p class="sub reveal">Score extracted speech against a clean reference — ITU-T P.862 (PESQ).</p>
+        <p class="pesq-intro muted reveal" style="margin-top:14px;font-size:14px;">
+          Upload the clean/original <b>reference</b> audio and the <b>degraded</b> file
+          (your extracted audio) to compare against it — one against one. PESQ is designed for
+          <b>speech</b> — scores on music or non-speech audio are not meaningful.
+        </p>
+      </section>
+
+      <div class="note pesq-dep-warn reveal" id="pesqDepWarn" hidden></div>
+
+      <div class="pesq-slots reveal">
+        <div class="slot">
+          <h3>Reference audio</h3>
+          <p class="slot-sub">The clean / original recording (one file).</p>
+          <input type="file" id="refFile" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.opus,.flac,.amr">
+        </div>
+        <div class="slot">
+          <h3>Degraded / test audio</h3>
+          <p class="slot-sub">The extracted recording to compare against the reference (one file).</p>
+          <input type="file" id="degFile" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.opus,.flac,.amr">
+        </div>
+      </div>
+
+      <div class="pesq-controls reveal">
+        <div class="mode-toggle" title="PESQ analysis bandwidth">
+          <label><input type="radio" name="pesqmode" value="wb" checked> Wideband (16 kHz)</label>
+          <label><input type="radio" name="pesqmode" value="nb"> Narrowband (8 kHz)</label>
+        </div>
+        <button id="runPesq" class="btn">Run PESQ</button>
+      </div>
+      <div style="text-align:center"><span id="pesqStatus" class="muted" style="font-size:14px;"></span></div>
+
+      <section class="results reveal" id="pesqResult" style="display:none">
+        <div class="results-head">
+          <h2>Results</h2>
+          <button class="btn ghost" id="pesqCsv">Export CSV</button>
+        </div>
+        <div class="card">
+          <div class="table-wrap">
+            <table id="pesqTbl"><thead><tr>
+              <th>File</th><th>PESQ (MOS-LQO)</th><th>Quality</th><th>Mode</th>
+              <th>Duration</th><th>Warnings</th>
+            </tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i style="background:#1d8a4e"></i> 4.0–4.5 Excellent</span>
+          <span><i style="background:#5fb62b"></i> 3.5–4.0 Good</span>
+          <span><i style="background:#d9a400"></i> 3.0–3.5 Fair</span>
+          <span><i style="background:#e06c00"></i> 2.0–3.0 Poor</span>
+          <span><i style="background:#c0392b"></i> &lt;2.0 Bad</span>
+        </div>
+        <p class="muted" style="text-align:center;font-size:12px;margin-top:10px;">
+          PESQ measures speech quality only; it assumes the reference and degraded signals are
+          time-aligned. Results on non-speech audio, or badly misaligned clips, are not meaningful.
+        </p>
+      </section>
     </section>
   </main>
 
@@ -655,6 +796,138 @@ async function pollStatus(){
   } catch(e){ /* transient network hiccup; keep polling */ }
 }
 
+/* ============================ Speech Quality (PESQ) ============================ */
+/* Fully isolated from the extractor above: its own state, its own /api/pesq/* calls. */
+const esc = s => String(s).replace(/[&<>"']/g, c => (
+  {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* ---- nav tab switching (Extractor <-> Speech Quality) ---- */
+let PESQ_DEPS_CHECKED = false;
+function switchView(view){
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+  $('#view-extract').hidden = (view !== 'extract');
+  $('#view-pesq').hidden = (view !== 'pesq');
+  if (view === 'pesq' && !PESQ_DEPS_CHECKED){ PESQ_DEPS_CHECKED = true; checkPesqDeps(); }
+  observeReveals();
+  scrollTo({top:0, behavior: REDUCE ? 'auto' : 'smooth'});
+}
+document.querySelectorAll('.nav-tab').forEach(t => t.onclick = () => switchView(t.dataset.view));
+
+async function checkPesqDeps(){
+  try {
+    const d = await (await fetch('/api/pesq/deps')).json();
+    const warn = $('#pesqDepWarn');
+    if (!d.available){
+      warn.innerHTML = '&#9888;&#65039; <b>PESQ is not ready.</b> ' + esc(d.message || '').replace(/\n/g,'<br>');
+      warn.hidden = false;
+      $('#runPesq').disabled = true;
+    } else { warn.hidden = true; $('#runPesq').disabled = false; }
+  } catch(e){ /* leave the button enabled; the run call will report any problem */ }
+}
+
+/* ---- PESQ upload state (one reference vs one degraded file) ---- */
+let REF = null;          // {token, name}
+let DEG = null;          // {token, name}
+let LAST_RESULT = null;  // for CSV export
+
+async function pesqUpload(file, role){
+  const r = await fetch('/api/pesq/upload?role=' + role + '&name=' + encodeURIComponent(file.name),
+                        {method:'POST', body:file});
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || 'upload failed');
+  return d;   // {token, name}
+}
+
+$('#refFile').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $('#pesqStatus').textContent = 'checking reference…';
+  try {
+    REF = await pesqUpload(f, 'ref');
+    $('#pesqStatus').textContent = 'reference ready: ' + REF.name;
+  } catch(err){ REF = null; e.target.value = ''; $('#pesqStatus').innerHTML =
+      '<span class="warn">reference rejected: ' + esc(err.message) + '</span>'; }
+};
+
+$('#degFile').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $('#pesqStatus').textContent = 'checking ' + f.name + '…';
+  try {
+    DEG = await pesqUpload(f, 'deg');
+    $('#pesqStatus').textContent = 'degraded file ready: ' + DEG.name;
+  } catch(err){ DEG = null; e.target.value = ''; $('#pesqStatus').innerHTML =
+      '<span class="warn">' + esc(f.name) + ' rejected: ' + esc(err.message) + '</span>'; }
+};
+
+function qClass(score){
+  if (score == null) return ['q-na', '—'];
+  if (score >= 4.0) return ['q-excellent', 'Excellent'];
+  if (score >= 3.5) return ['q-good', 'Good'];
+  if (score >= 3.0) return ['q-fair', 'Fair'];
+  if (score >= 2.0) return ['q-poor', 'Poor'];
+  return ['q-bad', 'Bad'];
+}
+
+$('#runPesq').onclick = async () => {
+  if (!REF){ $('#pesqStatus').innerHTML = '<span class="warn">add a reference file first</span>'; return; }
+  if (!DEG){ $('#pesqStatus').innerHTML = '<span class="warn">add a degraded file to compare</span>'; return; }
+  const mode = document.querySelector('input[name=pesqmode]:checked').value;
+  const btn = $('#runPesq'); btn.disabled = true; const old = btn.textContent; btn.textContent = 'running PESQ…';
+  $('#pesqStatus').textContent = 'scoring ' + DEG.name + '…';
+  try {
+    const r = await fetch('/api/pesq/run', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ref_token: REF.token, deg_token: DEG.token, mode})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'PESQ failed');
+    LAST_RESULT = d.result;
+    renderPesqResult(LAST_RESULT);
+    $('#pesqStatus').textContent = 'done';
+  } catch(e){ $('#pesqStatus').innerHTML = '<span class="warn">error: ' + esc(e.message) + '</span>'; }
+  btn.disabled = false; btn.textContent = old;
+};
+
+function renderPesqResult(r){
+  const tb = $('#pesqTbl tbody'); tb.innerHTML = '';
+  const [cls, label] = qClass(r.score);
+  const modeLabel = r.mode === 'nb' ? 'Narrowband' : 'Wideband';
+  const dur = r.duration != null ? r.duration + 's' : '—';
+  const notes = [];
+  if (r.error) notes.push('<span class="ferr">' + esc(r.error) + '</span>');
+  (r.warnings || []).forEach(w => notes.push(esc(w)));
+  const tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td>' + esc(r.name) + '</td>' +
+    '<td class="' + cls + '"><span class="score-badge"><span class="score-dot"></span>' +
+      (r.score != null ? r.score.toFixed(3) : '—') + '</span></td>' +
+    '<td class="' + cls + '">' + label + '</td>' +
+    '<td>' + modeLabel + '</td>' +
+    '<td>' + dur + '</td>' +
+    '<td class="warn-cell">' + (notes.length ? notes.join('<br>') : '<span class="muted">—</span>') + '</td>';
+  tb.appendChild(tr);
+  $('#pesqResult').style.display = '';
+  observeReveals();
+}
+
+$('#pesqCsv').onclick = () => {
+  const r = LAST_RESULT;
+  if (!r) return;
+  const head = ['file','pesq_score','quality','mode','reference_s','degraded_s','scored_s','warnings','error'];
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const [, label] = qClass(r.score);
+  const lines = [head.join(','), [
+    r.name, r.score != null ? r.score : '', r.score != null ? label : '',
+    r.mode === 'nb' ? 'Narrowband (8 kHz)' : 'Wideband (16 kHz)',
+    r.ref_dur != null ? r.ref_dur : '', r.deg_dur != null ? r.deg_dur : '',
+    r.duration != null ? r.duration : '', (r.warnings || []).join(' | '), r.error || ''
+  ].map(q).join(',')];
+  const blob = new Blob([lines.join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'pesq_results.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+
 observeReveals();   // reveal the hero on first paint
 </script>
 </body></html>
@@ -719,6 +992,9 @@ class Handler(BaseHTTPRequestHandler):
                                     "default_port": DEFAULT_STREAM_PORT})
         if u.path == "/api/stream/status":
             return self._stream_status(parse_qs(u.query).get("session", [""])[0])
+        if u.path == "/api/pesq/deps":
+            available, message = pesq_quality.deps_status()
+            return self._send(200, {"available": available, "message": message})
         if u.path == "/api/download":
             tok = parse_qs(u.query).get("f", [""])[0]
             path = OUTPUT_REGISTRY.get(tok)
@@ -746,6 +1022,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._stream_start()
             if u.path == "/api/stream/stop":
                 return self._stream_stop()
+            if u.path == "/api/pesq/upload":
+                return self._pesq_upload(u)
+            if u.path == "/api/pesq/run":
+                return self._pesq_run()
         except Exception as e:  # surface engine errors as JSON
             mediax.trace("web", f"ERROR on {u.path}: {type(e).__name__}: {e}")
             return self._send(400, {"error": str(e)})
@@ -891,6 +1171,77 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
         return info
+
+    # ---- Speech Quality (PESQ): isolated add-on endpoints ----------------- #
+    # These three methods (plus the /api/pesq/* routing lines and pesq_quality.py)
+    # are the entire server side of the feature -- removable without touching the
+    # extractor. Uploaded audio lives under _work/pesq/ and is deleted after a run.
+    def _pesq_upload(self, u):
+        """Accept one audio file (raw body, ?name=&role=ref|deg), validate that it
+        really is audio (not video), store it, and return a token."""
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > pesq_quality.MAX_PESQ_UPLOAD:
+            return self._send(400, {"error": "missing or oversized upload "
+                                    f"(max {pesq_quality.MAX_PESQ_UPLOAD // (1024*1024)} MB)"})
+        prune_pesq()       # opportunistically sweep uploads abandoned by earlier visits
+        name = parse_qs(u.query).get("name", ["audio"])[0]
+        name = os.path.basename(name) or "audio"
+        safe = SAFE_NAME.sub("_", name)
+        role = parse_qs(u.query).get("role", ["deg"])[0]
+        role = "ref" if role == "ref" else "deg"
+        token = uuid.uuid4().hex
+        path = os.path.join(PESQ_DIR, f"{role}_{token}_{safe}")
+        remaining = length
+        with open(path, "wb") as fh:
+            while remaining > 0:
+                chunk = self.rfile.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                fh.write(chunk)
+                remaining -= len(chunk)
+        try:
+            pesq_quality.validate_audio(path, name=name)   # audio-only gatekeeping
+        except ValueError as e:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return self._send(400, {"error": str(e)})
+        PESQ_REGISTRY[token] = {"path": path, "name": name}
+        mediax.trace("web", f"pesq upload ({role}) {name} -> {path}")
+        return self._send(200, {"token": token, "name": name})
+
+    @staticmethod
+    def _pesq_drop(*tokens):
+        """Forget these PESQ uploads and delete their files. Safe on unknown tokens."""
+        for tok in tokens:
+            info = PESQ_REGISTRY.pop(tok, None)
+            if info:
+                try:
+                    os.remove(info["path"])
+                except OSError:
+                    pass
+
+    def _pesq_run(self):
+        """Score one degraded file against one reference, then delete both uploads."""
+        length = int(self.headers.get("Content-Length", 0))
+        req = json.loads(self.rfile.read(length) or b"{}")
+        ref_tok, deg_tok = req.get("ref_token"), req.get("deg_token")
+        ref, deg = PESQ_REGISTRY.get(ref_tok), PESQ_REGISTRY.get(deg_tok)
+        missing = ("reference" if not ref or not os.path.exists(ref["path"]) else
+                   "degraded" if not deg or not os.path.exists(deg["path"]) else None)
+        if missing:
+            self._pesq_drop(ref_tok, deg_tok)   # don't strand the half that did arrive
+            return self._send(400, {"error": f"{missing} file not found — re-upload it"})
+        mode = req.get("mode", pesq_quality.DEFAULT_MODE)
+        mediax.trace("web", f"pesq run: ref={ref['name']} vs deg={deg['name']}, mode={mode}")
+        try:
+            result = pesq_quality.run_single(ref["path"], deg["name"], deg["path"], mode=mode)
+        except RuntimeError as e:        # PESQ extras not installed
+            return self._send(400, {"error": str(e)})
+        finally:
+            self._pesq_drop(ref_tok, deg_tok)   # clean up regardless of outcome
+        return self._send(200, {"result": result})
 
 
 if __name__ == "__main__":

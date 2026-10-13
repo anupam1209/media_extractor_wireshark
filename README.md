@@ -20,6 +20,7 @@ hear silence at exactly that point.
 - [Install the prerequisites](#install-the-prerequisites)
 - [Quick start](#quick-start)
 - [Web app](#web-app)
+- [Speech quality (PESQ)](#speech-quality-pesq)
 - [Command line](#command-line)
 - [Output files](#output-files)
 - [Timing modes: real vs compact](#timing-modes-real-vs-compact)
@@ -57,6 +58,12 @@ You need these command-line tools installed and on your `PATH`:
 | **GStreamer** (`gst-launch-1.0` with `amrnbdec` / `amrwbdec`) | best-quality AMR decode | recommended |
 
 No Python packages are required — the tool uses only the standard library.
+
+> **One optional add-on has extra dependencies.** The web app's **Speech Quality (PESQ)** tab
+> needs two Python packages (`numpy` + `pesq`), best installed in a **virtual environment** that
+> you activate before starting `webapp.py`. They are *not* required for extraction, streaming, or
+> anything else — install them only if you want PESQ scoring. See
+> [Speech quality (PESQ)](#speech-quality-pesq) below.
 
 > If GStreamer isn't available, AMR still decodes via ffmpeg's built-in decoder, but ffmpeg's
 > native AMR decoder may skip comfort-noise (SID) frames. **For AMR captures, GStreamer is
@@ -140,6 +147,82 @@ Maximum upload size is 500 MB.
 
 > The web server is meant for trusted/internal use (no authentication). Don't expose it to the
 > public internet as-is.
+
+---
+
+## Speech quality (PESQ)
+
+The web app has a second tab — **Speech Quality (PESQ)** — for measuring how good an *extracted*
+speech recording sounds compared with a clean reference, using **ITU-T P.862 (PESQ)**. A typical
+workflow: extract audio on the **Extractor** tab, download it, then come back to this tab, upload
+the original clean recording as the *reference* and the extracted file as *degraded*, and score
+the pair. Comparisons are **one file against one file**.
+
+This is an **optional, isolated add-on** (`pesq_quality.py`). It is the only part of the project
+with Python dependencies, and nothing else depends on it — if the extras aren't installed, the tab
+simply shows how to install them and the rest of the app works unchanged.
+
+### Setup: a virtual environment
+
+PESQ needs `numpy` + `pesq` installed **for the same Python that runs `webapp.py`**. The
+recommended way is a virtualenv, so these extras never pollute your system Python and the core
+tool stays dependency-free.
+
+**One-time setup:**
+```bash
+python3.12 -m venv .venv                 # 3.12 has prebuilt `pesq` wheels
+source .venv/bin/activate                # Windows: .venv\Scripts\activate
+pip install -r requirements.txt          # numpy + pesq
+```
+
+**Every time you want to use PESQ — activate the venv first, then start the app:**
+```bash
+source .venv/bin/activate                # (prompt shows "(.venv)")
+python3 webapp.py                        # now the PESQ tab works
+```
+When you're done, `deactivate` returns you to the system Python.
+
+> **⚠️ If you start `webapp.py` without activating the venv**, the app still runs and every
+> existing feature (detect, extract, download, stream to phone) works exactly as before — but the
+> **Speech Quality (PESQ)** tab will show "PESQ is not ready" with install instructions, because
+> that interpreter has no `numpy`/`pesq`. Activating the venv and restarting the app fixes it.
+
+> **Why Python 3.12?** The `pesq` package compiles a small C extension. Prebuilt wheels are
+> published for CPython 3.8–3.12; on newer versions (3.13+) pip falls back to building from
+> source, which needs a C toolchain — `xcode-select --install` on macOS, or
+> `sudo apt install build-essential python3-dev` on Debian/Ubuntu. Using 3.12 avoids all of that.
+> Check what you have with `python3 --version`; install 3.12 via `brew install python@3.12`
+> (macOS) or `sudo apt install python3.12-venv` (Ubuntu).
+
+A quick check that the extras are visible to the current interpreter:
+```bash
+python3 -c "import numpy, pesq; print('PESQ ready')"
+```
+
+**Use it** (with the venv active and the app running):
+1. Open the **Speech Quality (PESQ)** tab.
+2. Upload the clean **reference** audio and the **degraded** file (the extracted audio) —
+   one against one.
+3. Choose **Wideband (16 kHz)** (default) or **Narrowband (8 kHz)**.
+4. Click **Run PESQ**. The result shows the PESQ score (MOS-LQO), a colour-coded quality band,
+   duration, and any warnings. Export to CSV with one click.
+
+**Good to know:**
+- **Audio only.** Video files and non-audio uploads are rejected with a clear message.
+- Each file is automatically converted to **mono** at the chosen rate (ffmpeg) before scoring.
+- PESQ is **intrusive and speech-only** — it needs the reference and assumes the two signals are
+  **time-aligned**. Files are trimmed to the shorter length; a large duration difference raises a
+  warning. Scores on **music / non-speech**, or badly misaligned clips, are **not meaningful**.
+- Audio problems (silent audio, no speech detected, too short, …) are reported in the result row
+  as a readable message instead of crashing the request.
+- Uploads live in `_work/pesq/` and are deleted as soon as the comparison runs; files picked but
+  never scored are swept after an hour.
+- Score guide: **4.0–4.5** excellent · **3.5–4.0** good · **3.0–3.5** fair · **2.0–3.0** poor ·
+  **<2.0** bad (identical files score ~4.5 in wideband).
+
+**Tests:** with the venv active, `python3 test_pesq_quality.py` (or `pytest`) checks that identical
+files score high and a noisy copy scores lower. Without the venv the tests **skip** cleanly rather
+than fail, since the extras aren't installed.
 
 ---
 
@@ -458,10 +541,13 @@ This is expected.
 ## Project files
 
 ```
-mediax.py     # the engine + CLI (detect / extract / extract-all / validate)
-webapp.py     # zero-dependency web UI (imports mediax)
-wiresharks/   # sample input captures (for testing)
-AP_MUTE_ISSUE/# reference decoded outputs (.avi) + their source pcaps (for validation)
-_work/        # created at runtime by the web app: uploads/, outputs/
-              #   ...and logs/ (only when started with --debug; auto-pruned, git-ignored)
+mediax.py              # the engine + CLI (detect / extract / extract-all / validate)
+webapp.py              # zero-dependency web UI (imports mediax)
+pesq_quality.py        # OPTIONAL, isolated Speech Quality (PESQ) add-on (needs numpy + pesq)
+test_pesq_quality.py   # brief PESQ tests (identical -> high, noisy -> lower; skips if deps absent)
+requirements.txt       # ONLY the optional PESQ extras; the core needs no Python packages
+wiresharks/            # sample input captures (for testing)
+AP_MUTE_ISSUE/         # reference decoded outputs (.avi) + their source pcaps (for validation)
+_work/                 # created at runtime by the web app: uploads/, outputs/, pesq/
+                       #   ...and logs/ (only when started with --debug; auto-pruned, git-ignored)
 ```
