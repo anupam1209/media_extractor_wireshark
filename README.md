@@ -125,7 +125,9 @@ Then open **http://127.0.0.1:8000** in a browser.
 1. **Choose a `.pcap`/`.pcapng` file** and click **Upload & detect**.
 2. The detected streams appear in a table, each with its auto-identified codec.
 3. Pick a timing mode (**Real timing** is the default — see [below](#timing-modes-real-vs-compact)).
-4. Click **Extract** on any supported row, then **download** the `.wav`/`.mp4` or play it inline.
+4. Click **Extract** on any supported row, then **download** the `.wav`/`.mp4` or play it inline —
+   the inline player is **seekable** (drag the bar to jump anywhere; the server answers HTTP
+   `Range` requests on `/api/download`).
 5. **Optionally, stream a result to your phone** — click **📱 Stream to phone** on an extracted
    row for a guided 3-step flow that pushes the stream to **VLC** on your phone (MPEG-TS over UDP).
 
@@ -545,6 +547,7 @@ mediax.py              # the engine + CLI (detect / extract / extract-all / vali
 webapp.py              # zero-dependency web UI (imports mediax)
 pesq_quality.py        # OPTIONAL, isolated Speech Quality (PESQ) add-on (needs numpy + pesq)
 test_pesq_quality.py   # brief PESQ tests (identical -> high, noisy -> lower; skips if deps absent)
+test_download_range.py # tests for seek support (HTTP Range) on /api/download; stdlib only
 requirements.txt       # ONLY the optional PESQ extras; the core needs no Python packages
 wiresharks/            # sample input captures (for testing)
 AP_MUTE_ISSUE/         # reference decoded outputs (.avi) + their source pcaps (for validation)
