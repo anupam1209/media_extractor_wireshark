@@ -107,6 +107,49 @@ def stream_cmd(path, ip, port):
     return cmd
 
 
+# ---- HTTP Range support for /api/download (what makes the player's seek bar work) -- #
+DOWNLOAD_CHUNK = 64 * 1024   # bytes handed to the socket per write when serving a file
+
+
+class RangeNotSatisfiable(Exception):
+    """A well-formed Range header that lies entirely outside the file (-> HTTP 416)."""
+
+
+# Digits are capped so an absurdly long number can't trip Python's int() size limit.
+_BYTE_RANGE = re.compile(r"\s*bytes\s*=\s*(\d{0,18})\s*-\s*(\d{0,18})\s*", re.I)
+
+
+def parse_byte_range(header, size):
+    """Resolve an HTTP ``Range`` header against a file of ``size`` bytes (RFC 9110 s14).
+
+    Returns inclusive ``(start, end)`` offsets for a satisfiable single range -- ``N-M``,
+    open-ended ``N-`` or suffix ``-N`` -- with ``end`` clamped to the last byte.
+
+    Returns ``None`` when the header should be ignored and the whole file sent with a
+    normal 200: no header, a unit other than ``bytes``, a malformed value, or a
+    multi-range request. The RFC lets a server ignore all of these, and a browser's
+    media player never sends the last one.
+
+    Raises ``RangeNotSatisfiable`` for a well-formed range that starts past the end of
+    the file (any range on an empty file included); the caller answers 416."""
+    m = _BYTE_RANGE.fullmatch(header or "")
+    if not m:
+        return None
+    first, last = m.groups()
+    if first:                                   # "N-M" or "N-"
+        start = int(first)
+        end = int(last) if last else size - 1
+        if last and end < start:                # "5-2" is invalid -> ignore the header
+            return None                         # (not "N-" past EOF, which is a 416)
+    elif last:                                  # "-N": the final N bytes ("-0" lands past the end)
+        start, end = max(0, size - int(last)), size - 1
+    else:                                       # a bare "-"
+        return None
+    if start >= size:
+        raise RangeNotSatisfiable
+    return start, min(end, size - 1)
+
+
 PESQ_MAX_AGE_S = 3600   # stale PESQ uploads (picked but never scored) are swept after an hour
 
 
@@ -996,17 +1039,54 @@ class Handler(BaseHTTPRequestHandler):
             available, message = pesq_quality.deps_status()
             return self._send(200, {"available": available, "message": message})
         if u.path == "/api/download":
-            tok = parse_qs(u.query).get("f", [""])[0]
-            path = OUTPUT_REGISTRY.get(tok)
-            if not path or not os.path.exists(path):
-                return self._send(404, {"error": "not found"})
-            with open(path, "rb") as fh:
-                data = fh.read()
-            fn = os.path.basename(path)
-            ctype = "video/mp4" if fn.endswith(".mp4") else "audio/wav"
-            return self._send(200, data, ctype,
-                              {"Content-Disposition": f'attachment; filename="{fn}"'})
+            return self._download(parse_qs(u.query).get("f", [""])[0])
         return self._send(404, {"error": "not found"})
+
+    def _download(self, tok):
+        """Serve an extracted .wav/.mp4. Both the "download" link and the inline
+        <audio>/<video> player use this. It honours ``Range: bytes=...`` (HTTP 206)
+        because that is how a player seeks: without it the browser can only jump within
+        what it has already buffered, so dragging the seek bar snaps straight back. A
+        request with no Range header still gets the whole file as a plain 200."""
+        path = OUTPUT_REGISTRY.get(tok)
+        if not path or not os.path.exists(path):
+            return self._send(404, {"error": "not found"})
+        fn = os.path.basename(path)
+        ctype = "video/mp4" if fn.endswith(".mp4") else "audio/wav"
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            asked = self.headers.get("Range")
+            try:
+                rng = parse_byte_range(asked, size)
+            except RangeNotSatisfiable:
+                return self._send(416, {"error": "range not satisfiable"},
+                                  extra={"Content-Range": f"bytes */{size}"})
+            status = 200 if rng is None else 206
+            start, end = (0, size - 1) if rng is None else rng
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            if rng is not None:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Disposition", f'attachment; filename="{fn}"')
+            self.end_headers()
+            mediax.trace("web", f"download {fn}: Range={asked!r} -> {status}, "
+                                f"bytes {start}-{end}/{size}")
+            try:
+                fh.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = fh.read(min(DOWNLOAD_CHUNK, left))
+                    if not chunk:               # file shrank underneath us; can't meet the length
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+            except ConnectionError:
+                # The player hung up mid-transfer. It does this on every seek -- it drops the
+                # old request and opens a new Range request at the new position -- so this is
+                # expected, not an error worth a traceback.
+                self.close_connection = True
 
     # ---- POST: upload + extract ------------------------------------------ #
     def do_POST(self):
